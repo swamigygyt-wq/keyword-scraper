@@ -284,190 +284,177 @@ async function loadFromGist() {
 
 // ═══════════════════════════════════════════════════════════════
 //  CORE SCRAPER — PLAYWRIGHT + ANTI-DETECTION
+//  Navigate directly to tools.wordstream.com/fkt (the actual tool)
+//  Use page.evaluate() JS clicks (not Playwright locators)
 // ═══════════════════════════════════════════════════════════════
 async function scrapeKeyword(keyword, country) {
   let browser = null;
   const t0 = Date.now();
   
   try {
-    // Get executable path from @sparticuz/chromium (works on Render)
     const execPath = await sparticuzChromium.executablePath();
-    
-    // Random fingerprint
     const ua = UAS[Math.floor(Math.random() * UAS.length)];
     const tz = TZS[Math.floor(Math.random() * TZS.length)];
     const w = 1200 + Math.floor(Math.random() * 400);
     const h = 700 + Math.floor(Math.random() * 200);
 
-    // Launch fresh browser with unique fingerprint
     browser = await chromium.launch({
       executablePath: execPath,
       headless: true,
-      args: [
-        ...sparticuzChromium.args,
-        '--disable-blink-features=AutomationControlled'
-      ]
+      args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
     });
 
     const ctx = await browser.newContext({
-      userAgent: ua,
-      viewport: { width: w, height: h },
-      locale: 'en-US',
-      timezoneId: tz,
-      // Prevent Playwright detection
-      bypassCSP: true
+      userAgent: ua, viewport: { width: w, height: h },
+      locale: 'en-US', timezoneId: tz, bypassCSP: true
     });
-
     const page = await ctx.newPage();
 
-    // Anti-detection stealth
+    // Full stealth
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
       window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      // Override permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters);
+      const oq = window.navigator.permissions.query;
+      window.navigator.permissions.query = (p) => p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission }) : oq(p);
     });
-
     page.setDefaultTimeout(25000);
 
-    // ═══ STEP 1: Navigate to WordStream ═══
-    console.log(`    [1/10] Navigate...`);
-    await page.goto('https://www.wordstream.com/keywords', { 
-      waitUntil: 'domcontentloaded', timeout: 30000 
-    });
+    // ═══ STEP 1: Go DIRECTLY to the tool URL ═══
+    const encodedKw = encodeURIComponent(keyword);
+    const toolUrl = `https://tools.wordstream.com/fkt?website=${encodedKw}`;
+    console.log(`    [1/8] Navigate to tool...`);
+    await page.goto(toolUrl, { waitUntil: 'networkidle', timeout: 45000 });
     await page.waitForTimeout(3000 + Math.random() * 2000);
 
-    // ═══ STEP 2: Dismiss cookie popup ═══
-    console.log(`    [2/10] Cookies...`);
-    try {
-      const cookieBtn = page.locator('#onetrust-accept-btn-handler');
-      if (await cookieBtn.isVisible({ timeout: 3000 })) {
-        await cookieBtn.click();
-        await page.waitForTimeout(1000);
-      }
-    } catch(e) {}
+    // ═══ STEP 2: Dismiss cookie popup via JS ═══
+    console.log(`    [2/8] Cookies...`);
+    await page.evaluate(() => {
+      const btn = document.getElementById('onetrust-accept-btn-handler');
+      if (btn) btn.click();
+    });
+    await page.waitForTimeout(1000);
 
-    // ═══ STEP 3: Find and fill the keyword input ═══
-    console.log(`    [3/10] Type keyword...`);
-    const input = page.locator('input[type="text"]').first();
-    await input.waitFor({ state: 'visible', timeout: 8000 });
-    await input.click();
-    await input.fill('');
-    await page.waitForTimeout(300);
-    // Type human-like
-    for (const ch of keyword) {
-      await input.type(ch, { delay: 40 + Math.random() * 60 });
-    }
-    await page.waitForTimeout(1000 + Math.random() * 1000);
-
-    // ═══ STEP 4: Click Search ═══
-    console.log(`    [4/10] Search...`);
-    const searchBtn = page.locator('input[type="submit"]').first();
-    if (await searchBtn.isVisible({ timeout: 3000 })) {
-      await searchBtn.click();
-    } else {
-      // Fallback: find button with "Search" text
-      await page.locator('button:has-text("Search")').first().click();
-    }
-    await page.waitForTimeout(4000 + Math.random() * 2000);
-
-    // ═══ STEP 5: Handle "Refine Your Search" modal ═══
-    console.log(`    [5/10] Handle modal...`);
-    // The modal has its OWN keyword input + industry + country + Continue button
-    // We need to click "Continue" in the modal
-    let modalHandled = false;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      try {
-        // Try clicking Continue button (it's the big orange button in the modal)
-        const continueBtn = page.locator('button:has-text("Continue")').first();
-        if (await continueBtn.isVisible({ timeout: 2000 })) {
-          // Before clicking Continue, check if the modal input has our keyword
-          // If not, fill it
-          try {
-            const modalInputs = page.locator('[role="dialog"] input[type="text"], .MuiDialog-root input, .MuiModal-root input');
-            const count = await modalInputs.count();
-            if (count > 0) {
-              const modalInput = modalInputs.first();
-              const val = await modalInput.inputValue();
-              if (!val || val.trim() === '') {
-                await modalInput.fill(keyword);
-                await page.waitForTimeout(500);
-              }
+    // ═══ STEP 3: Click Continue/Search via JS (works on ANY element type) ═══
+    console.log(`    [3/8] Click Continue/Search...`);
+    let buttonClicked = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const clicked = await page.evaluate((countryLabel) => {
+        // Find ALL clickable elements with target text
+        const targets = ['Continue', 'CONTINUE', 'Search', 'SEARCH', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS'];
+        const all = document.querySelectorAll('button, a, input[type="submit"], div[role="button"], span[role="button"]');
+        
+        for (const el of all) {
+          const txt = (el.textContent || el.value || '').trim();
+          const isVisible = el.offsetWidth > 0 && el.offsetHeight > 0;
+          if (!isVisible) continue;
+          
+          for (const target of targets) {
+            if (txt.toUpperCase().includes(target.toUpperCase())) {
+              el.click();
+              return target;
             }
-          } catch(e) {}
-
-          // Select country in modal if not US
-          if (country.code !== 'US') {
-            try {
-              const selects = page.locator('select, [role="dialog"] select');
-              const count = await selects.count();
-              for (let i = 0; i < count; i++) {
-                const sel = selects.nth(i);
-                const options = await sel.locator('option').allTextContents();
-                if (options.some(o => o.includes(country.label) || o.includes(country.name))) {
-                  await sel.selectOption({ label: country.label });
-                  await page.waitForTimeout(500);
-                  break;
-                }
-              }
-            } catch(e) {}
           }
-
-          await continueBtn.click();
-          modalHandled = true;
-          console.log(`    [5/10] ✅ Continue clicked`);
-          break;
         }
-      } catch(e) {}
+        
+        // Also try: any orange/primary button
+        const primaryBtns = document.querySelectorAll('button[class*="primary"], button[class*="continue"], button[class*="Submit"]');
+        for (const btn of primaryBtns) {
+          if (btn.offsetWidth > 0 && btn.offsetHeight > 0) {
+            btn.click();
+            return 'primary-button';
+          }
+        }
+        
+        return null;
+      }, country.label);
       
-      // Also try "Get Keywords", "Show Keywords"
-      try {
-        for (const txt of ['Get Keywords', 'Show Keywords', 'View Results']) {
-          const btn = page.locator(`button:has-text("${txt}")`).first();
-          if (await btn.isVisible({ timeout: 500 })) {
-            await btn.click();
-            modalHandled = true;
-            console.log(`    [5/10] ✅ ${txt} clicked`);
+      if (clicked) {
+        console.log(`    [3/8] ✅ Clicked: ${clicked} (attempt ${attempt+1})`);
+        buttonClicked = true;
+        break;
+      }
+      await page.waitForTimeout(2000);
+    }
+    
+    if (!buttonClicked) {
+      console.log(`    [3/8] ⚠️ No button found — trying Enter key`);
+      await page.keyboard.press('Enter');
+    }
+
+    // ═══ STEP 4: Handle the "Refine Your Search" modal ═══
+    console.log(`    [4/8] Handle Refine modal...`);
+    await page.waitForTimeout(5000);
+    
+    // The refine modal has keyword input + country + Continue
+    // Fill keyword in modal input if empty, then click Continue
+    const modalResult = await page.evaluate((kw, countryLabel) => {
+      // Find all visible inputs and fill keyword if empty
+      const inputs = document.querySelectorAll('input[type="text"]');
+      for (const inp of inputs) {
+        if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
+          if (!inp.value || inp.value.trim() === '') {
+            // Use React-compatible value setter
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(inp, kw);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+      }
+      
+      // Try to select country in dropdowns
+      const selects = document.querySelectorAll('select');
+      for (const sel of selects) {
+        const options = Array.from(sel.options);
+        for (const opt of options) {
+          if (opt.text.includes(countryLabel)) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
             break;
           }
         }
-        if (modalHandled) break;
-      } catch(e) {}
+      }
       
-      await page.waitForTimeout(1500);
-    }
+      // Click Continue button (try all element types)
+      const allEls = document.querySelectorAll('button, a, div[role="button"]');
+      for (const el of allEls) {
+        const txt = (el.textContent || '').trim();
+        if (el.offsetWidth > 0 && el.offsetHeight > 0 && txt === 'Continue') {
+          el.click();
+          return 'continue-clicked';
+        }
+      }
+      
+      return 'no-continue-found';
+    }, keyword, country.label);
+    console.log(`    [4/8] Modal: ${modalResult}`);
 
-    // ═══ STEP 6: Wait for results to load ═══
-    console.log(`    [6/10] Wait for results...`);
-    await page.waitForTimeout(10000 + Math.random() * 5000);
+    // ═══ STEP 5: Wait for keyword results to load ═══
+    console.log(`    [5/8] Waiting for results...`);
+    await page.waitForTimeout(12000 + Math.random() * 5000);
 
-    // ═══ STEP 7: Check for "No Results" ═══
-    console.log(`    [7/10] Check results...`);
-    const pageText = await page.evaluate(() => document.body.innerText);
-    if (pageText.includes('No Results') && !pageText.includes('car') && !pageText.includes('insurance')) {
-      return { status: 'no_results', keyword, country: country.code, data: [], ms: Date.now() - t0 };
-    }
+    // ═══ STEP 6: Check if there's a second Continue/modal ═══
+    console.log(`    [6/8] Check for second modal...`);
+    await page.evaluate(() => {
+      const allEls = document.querySelectorAll('button, a, div[role="button"]');
+      for (const el of allEls) {
+        const txt = (el.textContent || '').trim();
+        if (el.offsetWidth > 0 && el.offsetHeight > 0 && 
+            (txt === 'Continue' || txt === 'Get Keywords' || txt === 'Show Keywords')) {
+          el.click();
+          return;
+        }
+      }
+    });
+    await page.waitForTimeout(8000);
 
-    // ═══ STEP 8: Wait for table ═══
-    console.log(`    [8/10] Find table...`);
-    try {
-      await page.waitForSelector('table tbody tr', { timeout: 10000 });
-    } catch(e) {
-      // Try alternate: maybe it's shown differently
-    }
-
-    // ═══ STEP 9: Extract ALL keyword data ═══
-    console.log(`    [9/10] Extract data...`);
+    // ═══ STEP 7: Extract keyword data ═══
+    console.log(`    [7/8] Extract data...`);
     const data = await page.evaluate(() => {
       const results = [];
-      
-      // Method 1: Standard table with th[scope=row]
       const rows = document.querySelectorAll('table tbody tr');
       for (const row of rows) {
         const th = row.querySelector('th[scope="row"]');
@@ -482,32 +469,30 @@ async function scrapeKeyword(keyword, country) {
           });
         }
       }
-      
-      // Method 2: If no th, try all td cells
+      // Fallback: all td cells
       if (results.length === 0) {
         for (const row of rows) {
           const cells = row.querySelectorAll('td');
           if (cells.length >= 5) {
             results.push({
-              keyword: cells[0]?.textContent?.trim() || '-',
-              volume: cells[1]?.textContent?.trim() || '-',
-              bidLow: cells[2]?.textContent?.trim() || '-',
-              bidHigh: cells[3]?.textContent?.trim() || '-',
-              competition: cells[4]?.textContent?.trim() || '-'
+              keyword: cells[0]?.textContent?.trim(),
+              volume: cells[1]?.textContent?.trim(),
+              bidLow: cells[2]?.textContent?.trim(),
+              bidHigh: cells[3]?.textContent?.trim(),
+              competition: cells[4]?.textContent?.trim()
             });
           }
         }
       }
-      
       return results;
     });
 
-    // ═══ STEP 10: Return results ═══
-    console.log(`    [10/10] Done — ${data.length} keywords`);
-    return { status: data.length > 0 ? 'ok' : 'empty', keyword, country: country.code, data, ms: Date.now() - t0 };
+    // ═══ STEP 8: Return ═══
+    console.log(`    [8/8] Done — ${data.length} keywords (${Math.round((Date.now()-t0)/1000)}s)`);
+    return { status: data.length > 0 ? 'ok' : 'no_results', keyword, country: country.code, data, ms: Date.now() - t0 };
 
   } catch(err) {
-    return { status: 'error', keyword, country: country.code, data: [], 
+    return { status: 'error', keyword, country: country.code, data: [],
              error: err.message.substring(0, 150), ms: Date.now() - t0 };
   } finally {
     if (browser) { try { await browser.close(); } catch(e) {} }
