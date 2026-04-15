@@ -1,12 +1,11 @@
 // ═══════════════════════════════════════════════════════════════
-//  KEYWORD SCRAPER v5 — PLAYWRIGHT + SPARTICUZ CHROMIUM
-//  ✅ Playwright (better anti-detection than Puppeteer)
-//  ✅ @sparticuz/chromium (works on Render without Docker)
-//  ✅ Browser rotation every 10 keywords (avoid rate limits)
-//  ✅ Saves to GitHub Gist (survives Render restart)
+//  KEYWORD SCRAPER v6 — DIRECT API + RECAPTCHA TOKEN
+//  ✅ Calls WordStream backend API directly (no UI interaction!)
+//  ✅ Uses Playwright ONLY to generate reCAPTCHA tokens
+//  ✅ 25 keywords per API call in clean JSON
+//  ✅ Browser rotation every 10 keywords
+//  ✅ Saves to GitHub Gist
 //  ✅ Multi-country (US → UK → CA → AU → DE)
-//  ✅ Never repeats a keyword
-//  ✅ Self-ping keeps Render alive
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -37,10 +36,24 @@ let stats = { ok: 0, noResults: 0, fails: 0, skipped: 0, saved: 0 };
 let lastError = '';
 let searchesSinceBrowserRotation = 0;
 
-// ═══ COUNTRIES + SEEDS (ordered by CPC) ═══
+// Browser session for reCAPTCHA tokens
+let activeBrowser = null;
+let activePage = null;
+let tokenCount = 0;
+
+// ═══ COUNTRY LOCATION IDS (Google Ads geo targets) ═══
+const COUNTRY_LOCATIONS = {
+  'US': [2840],
+  'UK': [2826],
+  'CA': [2124],
+  'AU': [2036],
+  'DE': [2276]
+};
+
+// ═══ COUNTRIES + SEEDS ═══
 const COUNTRIES = [
   {
-    code: 'US', name: 'United States', label: 'United States',
+    code: 'US', name: 'United States',
     seeds: [
       "car accident lawyer","truck accident lawyer","personal injury lawyer","wrongful death attorney",
       "slip and fall lawyer","dog bite lawyer","motorcycle accident lawyer","medical malpractice lawyer",
@@ -112,7 +125,7 @@ const COUNTRIES = [
     ]
   },
   {
-    code: 'UK', name: 'United Kingdom', label: 'United Kingdom',
+    code: 'UK', name: 'United Kingdom',
     seeds: [
       "personal injury claim calculator","car accident claim uk","road traffic accident solicitor",
       "whiplash claim calculator","workplace injury claim","slip trip fall compensation",
@@ -126,7 +139,7 @@ const COUNTRIES = [
     ]
   },
   {
-    code: 'CA', name: 'Canada', label: 'Canada',
+    code: 'CA', name: 'Canada',
     seeds: [
       "personal injury lawyer canada","car accident lawyer toronto","slip and fall lawyer ontario",
       "car insurance ontario","home insurance canada","life insurance canada",
@@ -137,7 +150,7 @@ const COUNTRIES = [
     ]
   },
   {
-    code: 'AU', name: 'Australia', label: 'Australia',
+    code: 'AU', name: 'Australia',
     seeds: [
       "personal injury lawyer australia","car accident lawyer sydney",
       "workers compensation lawyer nsw","medical negligence lawyer australia",
@@ -149,7 +162,7 @@ const COUNTRIES = [
     ]
   },
   {
-    code: 'DE', name: 'Germany', label: 'Germany',
+    code: 'DE', name: 'Germany',
     seeds: [
       "tax calculator germany","income tax germany","salary calculator germany",
       "health insurance germany","car insurance germany","mortgage calculator germany",
@@ -159,7 +172,7 @@ const COUNTRIES = [
   }
 ];
 
-// ═══ ALREADY DONE (from existing local data) ═══
+// ═══ ALREADY DONE ═══
 const ALREADY_DONE_US = new Set([
   "car accident lawyer","truck accident lawyer","personal injury lawyer","wrongful death attorney",
   "slip and fall lawyer","dog bite lawyer","work injury lawyer","premises liability lawyer",
@@ -190,22 +203,18 @@ const ALREADY_DONE_US = new Set([
   "spinal cord injury lawyer","toxic tort lawyer"
 ]);
 
-// ═══ USER AGENTS (rotated per browser session) ═══
+// ═══ USER AGENTS ═══
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 ];
-const TZS = ['America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
-             'Europe/London','Europe/Berlin','Australia/Sydney','America/Toronto'];
 
 // ═══════════════════════════════════════════════════════════════
-//  GITHUB GIST — PERSISTENT STORAGE
+//  GITHUB GIST STORAGE
 // ═══════════════════════════════════════════════════════════════
 function githubRequest(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -233,9 +242,9 @@ async function saveToGist() {
   if (allResults.length === 0) return;
   try {
     const batch = stats.saved + 1;
-    const csv = 'Keyword,Volume,CPC_Low,CPC_High,Competition,Seed,Country\n' +
-      allResults.map(r => 
-        `"${(r.keyword||'').replace(/"/g,"'")}","${r.volume}","${r.bidLow}","${r.bidHigh}","${r.competition}","${(r.seed||'').replace(/"/g,"'")}","${r.country}"`
+    const csv = 'Keyword,Volume,CPC_Low,CPC_High,Competition,CompetitionIndex,Seed,Country\n' +
+      allResults.map(r =>
+        `"${(r.keyword||'').replace(/"/g,"'")}","${r.volume}","${r.cpcLow}","${r.cpcHigh}","${r.competition}","${r.competitionIndex}","${(r.seed||'').replace(/"/g,"'")}","${r.country}"`
       ).join('\n');
     
     const stateData = JSON.stringify({
@@ -283,215 +292,194 @@ async function loadFromGist() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  CORE SCRAPER — PLAYWRIGHT + ANTI-DETECTION
-//  Navigate directly to tools.wordstream.com/fkt (the actual tool)
-//  Use page.evaluate() JS clicks (not Playwright locators)
+//  BROWSER SESSION — Only for reCAPTCHA tokens
+// ═══════════════════════════════════════════════════════════════
+async function createBrowserSession() {
+  console.log('  🌐 Creating browser session for reCAPTCHA...');
+  
+  if (activeBrowser) {
+    try { await activeBrowser.close(); } catch(e) {}
+    activeBrowser = null;
+    activePage = null;
+  }
+  
+  const execPath = await sparticuzChromium.executablePath();
+  const ua = UAS[Math.floor(Math.random() * UAS.length)];
+  
+  activeBrowser = await chromium.launch({
+    executablePath: execPath,
+    headless: true,
+    args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
+  });
+  
+  const ctx = await activeBrowser.newContext({
+    userAgent: ua,
+    viewport: { width: 1366, height: 768 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    bypassCSP: true
+  });
+  
+  activePage = await ctx.newPage();
+  
+  // Stealth
+  await activePage.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  });
+  
+  // Navigate to WordStream tools page to load reCAPTCHA
+  await activePage.goto('https://tools.wordstream.com/fkt?website=test', {
+    waitUntil: 'networkidle', timeout: 45000
+  });
+  await activePage.waitForTimeout(3000);
+  
+  // Accept cookies
+  await activePage.evaluate(() => {
+    const btn = document.getElementById('onetrust-accept-btn-handler');
+    if (btn) btn.click();
+  });
+  await activePage.waitForTimeout(1000);
+  
+  tokenCount = 0;
+  console.log('  🌐 ✅ Browser session ready');
+}
+
+async function getRecaptchaToken() {
+  if (!activePage) await createBrowserSession();
+  
+  try {
+    // Execute reCAPTCHA v3 to get a fresh token
+    const token = await activePage.evaluate(() => {
+      return new Promise((resolve, reject) => {
+        if (typeof grecaptcha === 'undefined') {
+          reject(new Error('grecaptcha not loaded'));
+          return;
+        }
+        grecaptcha.ready(() => {
+          // Find the site key from the page
+          const siteKey = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') 
+            || document.querySelector('.g-recaptcha')?.getAttribute('data-sitekey')
+            || '6LdKVRcqAAAAAOiLRWz_1OkX5S3QA-M8uFfNnksp'; // fallback
+          
+          grecaptcha.execute(siteKey, { action: 'fkt_search' })
+            .then(token => resolve(token))
+            .catch(err => reject(err));
+        });
+      });
+    });
+    
+    tokenCount++;
+    return token;
+  } catch(err) {
+    console.log(`  ⚠️ reCAPTCHA failed: ${err.message} — recreating session`);
+    await createBrowserSession();
+    
+    // Retry once
+    try {
+      const token = await activePage.evaluate(() => {
+        return new Promise((resolve, reject) => {
+          if (typeof grecaptcha === 'undefined') {
+            reject(new Error('grecaptcha not loaded'));
+            return;
+          }
+          grecaptcha.ready(() => {
+            grecaptcha.execute(document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') || '6LdKVRcqAAAAAOiLRWz_1OkX5S3QA-M8uFfNnksp', { action: 'fkt_search' })
+              .then(resolve)
+              .catch(reject);
+          });
+        });
+      });
+      tokenCount++;
+      return token;
+    } catch(e) {
+      throw new Error(`reCAPTCHA failed after retry: ${e.message}`);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DIRECT API CALL — No UI interaction!
+// ═══════════════════════════════════════════════════════════════
+function callWordStreamAPI(keyword, locationIds, recaptchaToken) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ keyword, locationIds });
+    
+    const req = https.request('https://tools-backend.wordstream.com/api/free-tools/google/keywords', {
+      method: 'POST',
+      headers: {
+        'User-Agent': UAS[Math.floor(Math.random() * UAS.length)],
+        'Origin': 'https://tools.wordstream.com',
+        'Referer': 'https://tools.wordstream.com/',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'recaptcha': recaptchaToken,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve({ status: res.statusCode, data: json });
+        } catch(e) {
+          resolve({ status: res.statusCode, data: data });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CORE SCRAPER — Token + API call
 // ═══════════════════════════════════════════════════════════════
 async function scrapeKeyword(keyword, country) {
-  let browser = null;
   const t0 = Date.now();
   
   try {
-    const execPath = await sparticuzChromium.executablePath();
-    const ua = UAS[Math.floor(Math.random() * UAS.length)];
-    const tz = TZS[Math.floor(Math.random() * TZS.length)];
-    const w = 1200 + Math.floor(Math.random() * 400);
-    const h = 700 + Math.floor(Math.random() * 200);
-
-    browser = await chromium.launch({
-      executablePath: execPath,
-      headless: true,
-      args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
-    });
-
-    const ctx = await browser.newContext({
-      userAgent: ua, viewport: { width: w, height: h },
-      locale: 'en-US', timezoneId: tz, bypassCSP: true
-    });
-    const page = await ctx.newPage();
-
-    // Full stealth
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      const oq = window.navigator.permissions.query;
-      window.navigator.permissions.query = (p) => p.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission }) : oq(p);
-    });
-    page.setDefaultTimeout(25000);
-
-    // ═══ STEP 1: Go DIRECTLY to the tool URL ═══
-    const encodedKw = encodeURIComponent(keyword);
-    const toolUrl = `https://tools.wordstream.com/fkt?website=${encodedKw}`;
-    console.log(`    [1/8] Navigate to tool...`);
-    await page.goto(toolUrl, { waitUntil: 'networkidle', timeout: 45000 });
-    await page.waitForTimeout(3000 + Math.random() * 2000);
-
-    // ═══ STEP 2: Dismiss cookie popup via JS ═══
-    console.log(`    [2/8] Cookies...`);
-    await page.evaluate(() => {
-      const btn = document.getElementById('onetrust-accept-btn-handler');
-      if (btn) btn.click();
-    });
-    await page.waitForTimeout(1000);
-
-    // ═══ STEP 3: Click Continue/Search via JS (works on ANY element type) ═══
-    console.log(`    [3/8] Click Continue/Search...`);
-    let buttonClicked = false;
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const clicked = await page.evaluate(() => {
-        const targets = ['Continue', 'CONTINUE', 'Search', 'SEARCH', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS'];
-        const all = document.querySelectorAll('button, a, input[type="submit"], div[role="button"], span[role="button"]');
-        
-        for (const el of all) {
-          const txt = (el.textContent || el.value || '').trim();
-          const isVisible = el.offsetWidth > 0 && el.offsetHeight > 0;
-          if (!isVisible) continue;
-          
-          for (const target of targets) {
-            if (txt.toUpperCase().includes(target.toUpperCase())) {
-              el.click();
-              return target;
-            }
-          }
-        }
-        
-        const primaryBtns = document.querySelectorAll('button[class*="primary"], button[class*="continue"], button[class*="Submit"]');
-        for (const btn of primaryBtns) {
-          if (btn.offsetWidth > 0 && btn.offsetHeight > 0) {
-            btn.click();
-            return 'primary-button';
-          }
-        }
-        
-        return null;
-      });
-      
-      if (clicked) {
-        console.log(`    [3/8] ✅ Clicked: ${clicked} (attempt ${attempt+1})`);
-        buttonClicked = true;
-        break;
-      }
-      await page.waitForTimeout(2000);
+    // Step 1: Get reCAPTCHA token
+    console.log(`    [1/3] Get reCAPTCHA token...`);
+    const token = await getRecaptchaToken();
+    console.log(`    [1/3] ✅ Token (${token.substring(0, 20)}...)`);
+    
+    // Step 2: Call API directly
+    console.log(`    [2/3] Call API...`);
+    const locationIds = COUNTRY_LOCATIONS[country.code] || [2840];
+    const result = await callWordStreamAPI(keyword, locationIds, token);
+    
+    if (result.status !== 200) {
+      console.log(`    [2/3] ❌ API ${result.status}: ${JSON.stringify(result.data).substring(0, 200)}`);
+      return { status: 'error', keyword, country: country.code, data: [],
+               error: `API ${result.status}`, ms: Date.now() - t0 };
     }
     
-    if (!buttonClicked) {
-      console.log(`    [3/8] ⚠️ No button found — trying Enter key`);
-      await page.keyboard.press('Enter');
-    }
-
-    // ═══ STEP 4: Handle the "Refine Your Search" modal ═══
-    console.log(`    [4/8] Handle Refine modal...`);
-    await page.waitForTimeout(5000);
+    // Step 3: Parse results
+    console.log(`    [3/3] Parse results...`);
+    const keywords = result.data.keywords || [];
+    const data = keywords.map(kw => ({
+      keyword: kw.keywordText,
+      volume: kw.searchVolume,
+      cpcLow: kw.lowTopPageBid,
+      cpcHigh: kw.highTopPageBid,
+      competition: kw.competition,
+      competitionIndex: kw.competitionIndex,
+      seed: keyword,
+      country: country.code
+    }));
     
-    // The refine modal has keyword input + country + Continue
-    // Fill keyword in modal input if empty, then click Continue
-    const args = { kw: keyword, countryLabel: country.label };
-    const modalResult = await page.evaluate((args) => {
-      const { kw, countryLabel } = args;
-      const inputs = document.querySelectorAll('input[type="text"]');
-      for (const inp of inputs) {
-        if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
-          if (!inp.value || inp.value.trim() === '') {
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(inp, kw);
-            inp.dispatchEvent(new Event('input', { bubbles: true }));
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        }
-      }
-      
-      const selects = document.querySelectorAll('select');
-      for (const sel of selects) {
-        const options = Array.from(sel.options);
-        for (const opt of options) {
-          if (opt.text.includes(countryLabel)) {
-            sel.value = opt.value;
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-            break;
-          }
-        }
-      }
-      
-      const allEls = document.querySelectorAll('button, a, div[role="button"]');
-      for (const el of allEls) {
-        const txt = (el.textContent || '').trim();
-        if (el.offsetWidth > 0 && el.offsetHeight > 0 && txt === 'Continue') {
-          el.click();
-          return 'continue-clicked';
-        }
-      }
-      
-      return 'no-continue-found';
-    }, args);
-    console.log(`    [4/8] Modal: ${modalResult}`);
-
-    // ═══ STEP 5: Wait for keyword results to load ═══
-    console.log(`    [5/8] Waiting for results...`);
-    await page.waitForTimeout(12000 + Math.random() * 5000);
-
-    // ═══ STEP 6: Check if there's a second Continue/modal ═══
-    console.log(`    [6/8] Check for second modal...`);
-    await page.evaluate(() => {
-      const allEls = document.querySelectorAll('button, a, div[role="button"]');
-      for (const el of allEls) {
-        const txt = (el.textContent || '').trim();
-        if (el.offsetWidth > 0 && el.offsetHeight > 0 && 
-            (txt === 'Continue' || txt === 'Get Keywords' || txt === 'Show Keywords')) {
-          el.click();
-          return;
-        }
-      }
-    });
-    await page.waitForTimeout(8000);
-
-    // ═══ STEP 7: Extract keyword data ═══
-    console.log(`    [7/8] Extract data...`);
-    const data = await page.evaluate(() => {
-      const results = [];
-      const rows = document.querySelectorAll('table tbody tr');
-      for (const row of rows) {
-        const th = row.querySelector('th[scope="row"]');
-        const tds = row.querySelectorAll('td');
-        if (th && tds.length >= 4) {
-          results.push({
-            keyword: th.textContent.trim(),
-            volume: tds[0]?.textContent?.trim() || '-',
-            bidLow: tds[1]?.textContent?.trim() || '-',
-            bidHigh: tds[2]?.textContent?.trim() || '-',
-            competition: tds[3]?.textContent?.trim() || '-'
-          });
-        }
-      }
-      // Fallback: all td cells
-      if (results.length === 0) {
-        for (const row of rows) {
-          const cells = row.querySelectorAll('td');
-          if (cells.length >= 5) {
-            results.push({
-              keyword: cells[0]?.textContent?.trim(),
-              volume: cells[1]?.textContent?.trim(),
-              bidLow: cells[2]?.textContent?.trim(),
-              bidHigh: cells[3]?.textContent?.trim(),
-              competition: cells[4]?.textContent?.trim()
-            });
-          }
-        }
-      }
-      return results;
-    });
-
-    // ═══ STEP 8: Return ═══
-    console.log(`    [8/8] Done — ${data.length} keywords (${Math.round((Date.now()-t0)/1000)}s)`);
-    return { status: data.length > 0 ? 'ok' : 'no_results', keyword, country: country.code, data, ms: Date.now() - t0 };
-
+    console.log(`    [3/3] ✅ ${data.length} keywords (${Math.round((Date.now()-t0)/1000)}s)`);
+    return { status: data.length > 0 ? 'ok' : 'no_results', keyword, country: country.code, 
+             data, ms: Date.now() - t0 };
+    
   } catch(err) {
     return { status: 'error', keyword, country: country.code, data: [],
              error: err.message.substring(0, 150), ms: Date.now() - t0 };
-  } finally {
-    if (browser) { try { await browser.close(); } catch(e) {} }
   }
 }
 
@@ -542,17 +530,16 @@ async function scrapeNext() {
   lastRun = new Date().toISOString();
   
   if (result.status === 'ok') {
-    result.data.forEach(d => { d.seed = keyword; d.country = country.code; });
     allResults.push(...result.data);
     searchedKeys.add(key);
     stats.ok++;
     consecutiveFails = 0;
-    console.log(`  ✅ ${result.data.length} keywords (${Math.round(result.ms/1000)}s) | Batch: ${allResults.length} | Total: ${totalSaved + allResults.length}`);
-  } else if (result.status === 'no_results' || result.status === 'empty') {
+    console.log(`  ✅ ${result.data.length} kw (${Math.round(result.ms/1000)}s) | Batch: ${allResults.length} | Total: ${totalSaved + allResults.length}`);
+  } else if (result.status === 'no_results') {
     searchedKeys.add(key);
     stats.noResults++;
     consecutiveFails = 0;
-    console.log(`  📭 ${result.status} (${Math.round(result.ms/1000)}s)`);
+    console.log(`  📭 no results (${Math.round(result.ms/1000)}s)`);
   } else {
     stats.fails++;
     consecutiveFails++;
@@ -562,13 +549,14 @@ async function scrapeNext() {
   
   // Auto-save every 25 keywords
   if (allResults.length >= 25) {
-    console.log(`\n  💾 Auto-saving ${allResults.length} keywords...`);
+    console.log(`\n  💾 Saving ${allResults.length} keywords...`);
     await saveToGist();
   }
   
-  // Log browser rotation
+  // Browser rotation every 10 keywords
   if (searchesSinceBrowserRotation >= 10) {
-    console.log(`  🔄 Browser rotation: ${searchesSinceBrowserRotation} searches done — next search gets fresh browser`);
+    console.log(`  🔄 Rotating browser session...`);
+    await createBrowserSession();
     searchesSinceBrowserRotation = 0;
   }
   
@@ -584,6 +572,14 @@ async function scrapeNext() {
 async function autoScrapeLoop() {
   console.log('\n🟢 Auto-scrape loop started\n');
   
+  // Create initial browser session
+  try {
+    await createBrowserSession();
+  } catch(err) {
+    console.log(`  ❌ Initial browser failed: ${err.message}`);
+    lastError = err.message;
+  }
+  
   while (autoRunning) {
     if (!isRunning) {
       const result = await scrapeNext();
@@ -594,20 +590,17 @@ async function autoScrapeLoop() {
         break;
       }
       
-      // Smart delay with browser rotation awareness
+      // Smart delay — API calls are fast, so shorter delays
       let delay;
       if (consecutiveFails >= 5) {
         delay = 180000; // 3 min cooldown
         console.log(`  🔴 5+ fails — cooling 3min`);
       } else if (consecutiveFails >= 3) {
-        delay = 120000; // 2 min
-        console.log(`  🟡 3+ fails — cooling 2min`);
-      } else if (searchesSinceBrowserRotation === 0) {
-        // Just rotated browser — extra delay
-        delay = 30000 + Math.random() * 20000;
-        console.log(`  🔄 Fresh session — waiting 30-50s`);
+        delay = 90000; // 1.5 min
+        console.log(`  🟡 3+ fails — cooling 90s`);
       } else {
-        delay = 50000 + Math.random() * 30000; // 50-80s
+        // Normal: 20-40 seconds between calls (much faster than before!)
+        delay = 20000 + Math.random() * 20000;
       }
       
       await new Promise(r => setTimeout(r, delay));
@@ -630,7 +623,8 @@ app.get('/', (req, res) => {
   const uptime = Math.round((Date.now() - startTime) / 60000);
   
   res.json({
-    status: autoRunning ? '🟢 AUTO-SCRAPING' : '🔴 STOPPED',
+    status: autoRunning ? '🟢 AUTO-SCRAPING (v6 API MODE)' : '🔴 STOPPED',
+    mode: 'DIRECT API — No UI interaction!',
     uptime: `${uptime} min (${(uptime/60).toFixed(1)} hrs)`,
     currentCountry: `${c.name} (${c.code})`,
     seedProgress: `${currentSeedIdx}/${c.seeds.length}`,
@@ -640,10 +634,10 @@ app.get('/', (req, res) => {
     totalKeywords: totalSaved + allResults.length,
     totalSearches,
     searchedSeeds: searchedKeys.size,
-    browserRotation: `${searchesSinceBrowserRotation}/10`,
+    browserSession: `tokens: ${tokenCount}, rotation in: ${10 - searchesSinceBrowserRotation}`,
     gistId: GIST_ID || 'not created yet',
     stats, isRunning, lastRun, consecutiveFails, lastError,
-    eta: `~${Math.round((totalSeeds - totalSearches - stats.skipped) * 65 / 3600)} hours`
+    eta: `~${Math.round((totalSeeds - totalSearches - stats.skipped) * 30 / 3600)} hours`
   });
 });
 
@@ -657,9 +651,9 @@ app.get('/results', (req, res) => {
 });
 
 app.get('/csv', (req, res) => {
-  let csv = 'Keyword,Volume,CPC_Low,CPC_High,Competition,Seed,Country\n';
+  let csv = 'Keyword,Volume,CPC_Low,CPC_High,Competition,CompetitionIndex,Seed,Country\n';
   allResults.forEach(r => {
-    csv += `"${(r.keyword||'').replace(/"/g,"'")}","${r.volume}","${r.bidLow}","${r.bidHigh}","${r.competition}","${(r.seed||'').replace(/"/g,"'")}","${r.country}"\n`;
+    csv += `"${(r.keyword||'').replace(/"/g,"'")}","${r.volume}","${r.cpcLow}","${r.cpcHigh}","${r.competition}","${r.competitionIndex}","${(r.seed||'').replace(/"/g,"'")}","${r.country}"\n`;
   });
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename=keywords.csv');
@@ -668,22 +662,10 @@ app.get('/csv', (req, res) => {
 
 app.get('/top', (req, res) => {
   const sorted = [...allResults]
-    .map(r => ({ ...r, cpc: parseFloat((r.bidHigh || '0').replace(/[^0-9.]/g, '')) || 0 }))
-    .filter(r => r.cpc > 0)
-    .sort((a, b) => b.cpc - a.cpc)
+    .filter(r => r.cpcHigh > 0)
+    .sort((a, b) => b.cpcHigh - a.cpcHigh)
     .slice(0, 100);
   res.json({ top100: sorted });
-});
-
-app.get('/stats', (req, res) => {
-  const byCountry = {};
-  allResults.forEach(r => {
-    if (!byCountry[r.country]) byCountry[r.country] = { count: 0, uniqueSeeds: new Set() };
-    byCountry[r.country].count++;
-    byCountry[r.country].uniqueSeeds.add(r.seed);
-  });
-  Object.keys(byCountry).forEach(k => { byCountry[k].uniqueSeeds = byCountry[k].uniqueSeeds.size; });
-  res.json({ byCountry, batchTotal: allResults.length, totalSaved, totalSearches, stats });
 });
 
 app.get('/save', async (req, res) => {
@@ -702,25 +684,19 @@ const totalSeeds = COUNTRIES.reduce((s, c) => s + c.seeds.length, 0);
 
 app.listen(PORT, async () => {
   console.log(`\n${'═'.repeat(55)}`);
-  console.log(`  🚀 KEYWORD SCRAPER v5 — PLAYWRIGHT + SPARTICUZ`);
+  console.log(`  🚀 KEYWORD SCRAPER v6 — DIRECT API MODE`);
   console.log(`${'═'.repeat(55)}`);
+  console.log(`  Mode:       DIRECT API (no UI clicks!)`);
   console.log(`  Seeds:      ${totalSeeds} across ${COUNTRIES.length} countries`);
-  console.log(`  Countries:  ${COUNTRIES.map(c => `${c.code}(${c.seeds.length})`).join(' → ')}`);
   console.log(`  Max KW:     ${totalSeeds * 25} (${totalSeeds} × 25 per search)`);
   console.log(`  Rotation:   New browser every 10 keywords`);
-  console.log(`  Schedule:   1 keyword every ~60s`);
-  console.log(`  ETA:        ~${Math.round(totalSeeds * 65 / 3600)} hours`);
+  console.log(`  Speed:      ~2 keywords/minute (3x faster!)`);
+  console.log(`  ETA:        ~${Math.round(totalSeeds * 30 / 3600)} hours`);
   console.log(`  Storage:    GitHub Gist`);
-  console.log(`${'═'.repeat(55)}`);
-  console.log(`  Dashboard:  /`);
-  console.log(`  Trigger:    /scrape`);
-  console.log(`  Results:    /results  |  /csv  |  /top  |  /stats`);
-  console.log(`  Control:    /pause  |  /resume  |  /save`);
   console.log(`${'═'.repeat(55)}\n`);
   
   await loadFromGist();
   
-  // Auto-start after 10s
   setTimeout(() => {
     autoRunning = true;
     autoScrapeLoop();
