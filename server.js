@@ -9,7 +9,8 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 const https = require('https');
 
 const app = express();
@@ -414,12 +415,16 @@ async function scrapeKeyword(keyword, country) {
   const delay = ms => new Promise(r => setTimeout(r, ms));
   
   try {
-    // Launch fresh browser each time
+    // Launch fresh browser each time (using @sparticuz/chromium for cloud compatibility)
+    chromium.setHeadlessMode = true;
+    chromium.setGraphicsMode = false;
     browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-             '--disable-blink-features=AutomationControlled',
-             '--disable-extensions', '--single-process', '--no-zygote']
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      args: [
+        ...chromium.args,
+        '--disable-blink-features=AutomationControlled'
+      ]
     });
     
     const ua = UAS[Math.floor(Math.random() * UAS.length)];
