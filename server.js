@@ -537,35 +537,63 @@ async function scrapeKeyword(keyword, country) {
     }
     await page.waitForTimeout(1000);
 
-    // Step 3: Submit/Search
+    // Step 3: Submit/Search — discover ALL clickable elements
     console.log(`    [3/5] Click Search/Submit...`);
     const clickResult = await page.evaluate(() => {
-      // Try submit buttons first
-      const submits = document.querySelectorAll('input[type="submit"], button[type="submit"]');
-      for (const s of submits) {
-        if (s.offsetWidth > 0) { s.click(); return 'submit-' + (s.value || s.textContent).trim().substring(0, 20); }
-      }
-      // Try buttons with search-like text
-      const targets = ['Search', 'Find', 'Get', 'Submit', 'Continue', 'FIND MY KEYWORDS'];
-      const btns = document.querySelectorAll('button, a.btn, div[role="button"], a[role="button"]');
-      for (const btn of btns) {
-        const txt = (btn.textContent || '').trim();
-        if (btn.offsetWidth > 0 && targets.some(t => txt.toUpperCase().includes(t.toUpperCase()))) {
-          btn.click();
-          return 'btn-' + txt.substring(0, 30);
+      const log = [];
+      
+      // Scan ALL clickable-looking elements
+      const everything = document.querySelectorAll('button, input[type="submit"], a, div[role="button"], span[role="button"], [onclick], form');
+      for (const el of everything) {
+        if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+          const tag = el.tagName;
+          const txt = (el.textContent || el.value || '').trim().substring(0, 50);
+          const cls = el.className?.substring?.(0, 40) || '';
+          const href = el.href || '';
+          if (txt.length > 0) log.push(`${tag}[${cls}]: "${txt}" ${href ? '→'+href.substring(0,40) : ''}`);
         }
       }
-      // Try Enter on active input
-      const focused = document.activeElement;
-      if (focused && focused.tagName === 'INPUT') {
-        focused.form?.submit();
-        return 'form-submit';
-      }
-      return 'no-button';
-    });
-    console.log(`    [3/5] Click: ${clickResult}`);
 
-    // Also press Enter
+      // Strategy 1: Find the form and submit it
+      const forms = document.querySelectorAll('form');
+      for (const form of forms) {
+        const formInputs = form.querySelectorAll('input:not([type="hidden"])');
+        if (formInputs.length > 0) {
+          // This form has visible inputs — it's probably the search form
+          form.submit();
+          return { method: 'form-submit', log: log.slice(0, 10) };
+        }
+      }
+
+      // Strategy 2: Click anything with keyword/search text
+      const targets = ['Search', 'Find', 'Get Keywords', 'Submit', 'Continue', 'FIND MY KEYWORDS', 'Free Keyword'];
+      const all = document.querySelectorAll('*');
+      for (const el of all) {
+        const txt = (el.textContent || el.value || '').trim();
+        const tag = el.tagName;
+        if (el.offsetWidth > 0 && el.offsetHeight > 0 && (tag === 'A' || tag === 'BUTTON' || tag === 'DIV' || tag === 'SPAN' || tag === 'INPUT')) {
+          for (const t of targets) {
+            if (txt.toUpperCase() === t.toUpperCase() || (txt.length < 30 && txt.toUpperCase().includes(t.toUpperCase()))) {
+              el.click();
+              return { method: 'text-click', clicked: txt.substring(0, 30), tag, log: log.slice(0, 10) };
+            }
+          }
+        }
+      }
+
+      // Strategy 3: Submit via active input's form
+      const focused = document.activeElement;
+      if (focused && focused.form) {
+        focused.form.submit();
+        return { method: 'focused-form-submit', log: log.slice(0, 10) };
+      }
+
+      return { method: 'none', log: log.slice(0, 15) };
+    });
+    console.log(`    [3/5] Click: ${JSON.stringify(clickResult)}`);
+    lastDebugInfo.clickResult = clickResult;
+
+    // Also press Enter on the input
     await page.keyboard.press('Enter');
     await page.waitForTimeout(8000 + Math.random() * 4000);
 
