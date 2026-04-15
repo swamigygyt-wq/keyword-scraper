@@ -9,7 +9,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
-const { chromium } = require('playwright-core');
+const puppeteer = require('puppeteer');
 const https = require('https');
 
 const app = express();
@@ -411,44 +411,33 @@ async function loadFromGist() {
 async function scrapeKeyword(keyword, country) {
   let browser = null;
   const t0 = Date.now();
+  const delay = ms => new Promise(r => setTimeout(r, ms));
   
   try {
-    // Launch fresh browser each time (different fingerprint)
-    const launchOpts = {
-      headless: true,
+    // Launch fresh browser each time
+    browser = await puppeteer.launch({
+      headless: 'new',
       args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
              '--disable-blink-features=AutomationControlled',
-             '--disable-extensions', '--single-process']
-    };
-    // Use system Chromium if available (Docker/Render)
-    if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
-      launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
-    }
-    browser = await chromium.launch(launchOpts);
+             '--disable-extensions', '--single-process', '--no-zygote']
+    });
     
     const ua = UAS[Math.floor(Math.random() * UAS.length)];
-    const tz = TZS[Math.floor(Math.random() * TZS.length)];
     const w = 1200 + Math.floor(Math.random() * 400);
     const h = 700 + Math.floor(Math.random() * 200);
     
-    const ctx = await browser.newContext({
-      userAgent: ua,
-      viewport: { width: w, height: h },
-      locale: 'en-US',
-      timezoneId: tz
-    });
-    
-    const page = await ctx.newPage();
+    const page = await browser.newPage();
+    await page.setUserAgent(ua);
+    await page.setViewport({ width: w, height: h });
     
     // Anti-detection
-    await page.addInitScript(() => {
+    await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
       window.chrome = { runtime: {} };
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     });
 
-    // Set reasonable timeouts
     page.setDefaultTimeout(20000);
 
     // 1. Navigate
@@ -456,46 +445,50 @@ async function scrapeKeyword(keyword, country) {
       waitUntil: 'domcontentloaded', 
       timeout: 30000 
     });
-    await page.waitForTimeout(3000 + Math.random() * 3000);
+    await delay(3000 + Math.random() * 3000);
 
-    // 2. Dismiss popups (try all common ones)
-    const popups = ['#onetrust-accept-btn-handler', 'button:has-text("Accept All")',
-                    'button:has-text("Accept")', '[aria-label="close"]', 
-                    'button:has-text("Close")', '.modal-close'];
-    for (const sel of popups) {
+    // 2. Dismiss popups
+    const popupSels = ['#onetrust-accept-btn-handler', '[aria-label="close"]', '.modal-close'];
+    for (const sel of popupSels) {
       try {
-        const el = page.locator(sel);
-        if (await el.isVisible({ timeout: 1000 })) {
-          await el.click();
-          await page.waitForTimeout(800);
-        }
+        const el = await page.$(sel);
+        if (el) { await el.click(); await delay(800); }
       } catch(e) {}
     }
+    // Try text-based buttons
+    try {
+      const buttons = await page.$$('button');
+      for (const btn of buttons) {
+        const txt = await page.evaluate(el => el.textContent, btn);
+        if (txt && (txt.includes('Accept') || txt.includes('Close'))) {
+          await btn.click(); await delay(800); break;
+        }
+      }
+    } catch(e) {}
 
     // 3. Type keyword (human-like)
-    const input = page.locator('input[placeholder*="keyword"], input[placeholder*="Keyword"], input[type="text"]').first();
-    if (!await input.isVisible({ timeout: 5000 })) {
-      throw new Error('Input field not found');
-    }
+    const input = await page.$('input[placeholder*="keyword"], input[placeholder*="Keyword"], input[type="text"]');
+    if (!input) throw new Error('Input field not found');
     await input.click();
-    await input.fill('');
-    await page.waitForTimeout(500);
+    await page.evaluate(el => el.value = '', input);
+    await delay(500);
     for (const ch of keyword) {
-      await input.type(ch, { delay: 50 + Math.random() * 80 });
+      await page.keyboard.type(ch, { delay: 50 + Math.random() * 80 });
     }
-    await page.waitForTimeout(1000 + Math.random() * 1000);
+    await delay(1000 + Math.random() * 1000);
 
     // 4. Select country if not US
     if (country.code !== 'US') {
       try {
-        const selects = page.locator('select');
-        const count = await selects.count();
-        for (let i = 0; i < count; i++) {
-          const sel = selects.nth(i);
-          const options = await sel.locator('option').allTextContents();
+        const selects = await page.$$('select');
+        for (const sel of selects) {
+          const options = await page.evaluate(s => Array.from(s.options).map(o => o.text), sel);
           if (options.some(o => o.includes(country.label) || o.includes(country.name))) {
-            await sel.selectOption({ label: country.label });
-            await page.waitForTimeout(1000);
+            await page.evaluate((s, label) => {
+              const opt = Array.from(s.options).find(o => o.text.includes(label));
+              if (opt) { s.value = opt.value; s.dispatchEvent(new Event('change')); }
+            }, sel, country.label);
+            await delay(1000);
             break;
           }
         }
@@ -503,45 +496,46 @@ async function scrapeKeyword(keyword, country) {
     }
 
     // 5. Click search
-    const searchBtn = page.locator('input[type="submit"], button:has-text("Search")').first();
-    if (!await searchBtn.isVisible({ timeout: 3000 })) {
-      throw new Error('Search button not found');
+    const searchBtn = await page.$('input[type="submit"]') || await page.$('button[type="submit"]');
+    if (!searchBtn) {
+      // Try text-based search button
+      const btns = await page.$$('button');
+      let found = false;
+      for (const btn of btns) {
+        const txt = await page.evaluate(el => el.textContent, btn);
+        if (txt && txt.includes('Search')) { await btn.click(); found = true; break; }
+      }
+      if (!found) throw new Error('Search button not found');
+    } else {
+      await searchBtn.click();
     }
-    await searchBtn.click();
-    await page.waitForTimeout(5000 + Math.random() * 2000);
+    await delay(5000 + Math.random() * 2000);
 
-    // 6. Handle Refine/Continue modal
-    const continueBtns = [
-      'button:has-text("Continue")',
-      'button:has-text("Get Keywords")',
-      'button:has-text("Show Keywords")',
-      'button:has-text("View Results")'
-    ];
-    for (const sel of continueBtns) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 3000 })) {
+    // 6. Handle Continue/Get Keywords buttons
+    const continueTexts = ['Continue', 'Get Keywords', 'Show Keywords', 'View Results'];
+    try {
+      const allBtns = await page.$$('button');
+      for (const btn of allBtns) {
+        const txt = await page.evaluate(el => el.textContent.trim(), btn);
+        if (continueTexts.some(t => txt.includes(t))) {
           await btn.click();
-          await page.waitForTimeout(8000 + Math.random() * 4000);
+          await delay(8000 + Math.random() * 4000);
           break;
         }
-      } catch(e) {}
-    }
+      }
+    } catch(e) {}
 
-    // 7. Extra wait for data to load
-    await page.waitForTimeout(3000 + Math.random() * 2000);
+    // 7. Extra wait
+    await delay(3000 + Math.random() * 2000);
 
-    // 8. Check "No Results"
-    let noRes = false;
-    try { noRes = await page.locator('text=No Results').isVisible({ timeout: 2000 }); } catch(e) {}
-    if (noRes) {
+    // 8. Check No Results
+    const pageText = await page.evaluate(() => document.body.innerText);
+    if (pageText.includes('No Results')) {
       return { status: 'no_results', keyword, country: country.code, data: [], ms: Date.now() - t0 };
     }
 
-    // 9. Wait for table rows
-    try {
-      await page.waitForSelector('table tbody tr th[scope="row"]', { timeout: 8000 });
-    } catch(e) {}
+    // 9. Wait for table
+    try { await page.waitForSelector('table tbody tr th[scope="row"]', { timeout: 8000 }); } catch(e) {}
 
     // 10. Extract data
     const data = await page.evaluate(() => {
@@ -566,7 +560,6 @@ async function scrapeKeyword(keyword, country) {
     return { status: 'error', keyword, country: country.code, data: [], 
              error: err.message.substring(0, 100), ms: Date.now() - t0 };
   } finally {
-    // ALWAYS close browser (prevent memory leaks)
     if (browser) {
       try { await browser.close(); } catch(e) {}
     }
