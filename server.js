@@ -414,11 +414,17 @@ async function scrapeKeyword(keyword, country) {
   
   try {
     // Launch fresh browser each time (different fingerprint)
-    browser = await chromium.launch({
+    const launchOpts = {
       headless: true,
       args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-             '--disable-blink-features=AutomationControlled']
-    });
+             '--disable-blink-features=AutomationControlled',
+             '--disable-extensions', '--single-process']
+    };
+    // Use system Chromium if available (Docker/Render)
+    if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+      launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+    }
+    browser = await chromium.launch(launchOpts);
     
     const ua = UAS[Math.floor(Math.random() * UAS.length)];
     const tz = TZS[Math.floor(Math.random() * TZS.length)];
