@@ -1,0 +1,5 @@
+node_modules/
+test_screenshots/
+test_local.js
+already_done.json
+*.png

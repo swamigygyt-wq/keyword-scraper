@@ -1,0 +1,13 @@
+{
+  "name": "keyword-scraper-render",
+  "version": "1.0.0",
+  "description": "Keyword research scraper on Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.1",
+    "playwright-core": "1.42.0"
+  }
+}
