@@ -292,44 +292,158 @@ async function loadFromGist() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  CORE SCRAPER — Intercept the React app's own API call
-//  Load page → fill keyword → click Continue → intercept response
-//  The app generates reCAPTCHA tokens FOR US!
+//  HEAVY STEALTH — fool WordStream's bot detection on Render
 // ═══════════════════════════════════════════════════════════════
+const STEALTH_SCRIPT = `
+  // 1. Hide webdriver
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  delete navigator.__proto__.webdriver;
+
+  // 2. Chrome object
+  window.chrome = {
+    runtime: { onConnect: { addListener: () => {}, removeListener: () => {} },
+               sendMessage: () => {}, connect: () => ({ onMessage: { addListener: () => {} }, postMessage: () => {} }) },
+    loadTimes: () => ({ commitLoadTime: Date.now() / 1000, finishDocumentLoadTime: Date.now() / 1000 + 0.1 }),
+    csi: () => ({ pageT: Date.now(), startE: Date.now(), onloadT: Date.now() + 100 }),
+    app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+           getDetails: () => null, getIsInstalled: () => false, runningState: () => 'cannot_run' }
+  };
+
+  // 3. Proper plugins
+  const mockPlugin = { name: 'Chrome PDF Plugin', description: 'Portable Document Format', filename: 'internal-pdf-viewer',
+    length: 1, item: () => ({ type: 'application/x-google-chrome-pdf' }), namedItem: () => ({ type: 'application/x-google-chrome-pdf' }) };
+  const mockPlugin2 = { name: 'Chrome PDF Viewer', description: '', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+    length: 1, item: () => ({ type: 'application/pdf' }), namedItem: () => ({ type: 'application/pdf' }) };
+  const pluginArray = [mockPlugin, mockPlugin2];
+  pluginArray.item = (i) => pluginArray[i];
+  pluginArray.namedItem = (n) => pluginArray.find(p => p.name === n);
+  pluginArray.refresh = () => {};
+  Object.defineProperty(navigator, 'plugins', { get: () => pluginArray });
+
+  // 4. Languages
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+
+  // 5. Hardware
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+  Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+  Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+  // 6. Permissions
+  const origQuery = window.Permissions?.prototype?.query;
+  if (origQuery) {
+    window.Permissions.prototype.query = (params) => {
+      if (params.name === 'notifications') return Promise.resolve({ state: 'denied', onchange: null });
+      return origQuery.call(navigator.permissions, params);
+    };
+  }
+
+  // 7. WebGL — spoof vendor/renderer
+  const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(p) {
+    if (p === 37445) return 'Google Inc. (NVIDIA)';
+    if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+    return getParameterOrig.call(this, p);
+  };
+  if (typeof WebGL2RenderingContext !== 'undefined') {
+    const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(p) {
+      if (p === 37445) return 'Google Inc. (NVIDIA)';
+      if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+      return getParam2.call(this, p);
+    };
+  }
+
+  // 8. Canvas noise (randomize fingerprint)
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (this.width === 0 && this.height === 0) return origToDataURL.call(this, type);
+    const ctx = this.getContext('2d');
+    if (ctx) {
+      const imageData = ctx.getImageData(0, 0, Math.min(this.width, 10), Math.min(this.height, 10));
+      for (let i = 0; i < imageData.data.length; i += 4) {
+        imageData.data[i] = imageData.data[i] ^ (Math.random() > 0.5 ? 1 : 0);
+      }
+      ctx.putImageData(imageData, 0, 0);
+    }
+    return origToDataURL.call(this, type);
+  };
+
+  // 9. Connection
+  Object.defineProperty(navigator, 'connection', { get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }) });
+
+  // 10. Media devices
+  if (navigator.mediaDevices) {
+    navigator.mediaDevices.enumerateDevices = () => Promise.resolve([
+      { deviceId: 'default', kind: 'audioinput', label: '', groupId: 'g1' },
+      { deviceId: 'default', kind: 'videoinput', label: '', groupId: 'g2' },
+      { deviceId: 'default', kind: 'audiooutput', label: '', groupId: 'g3' }
+    ]);
+  }
+`;
+
+let lastDebugInfo = null;
+
+// ═══════════════════════════════════════════════════════════════
+//  CORE SCRAPER — STEALTH BROWSER + API INTERCEPT
+// ═══════════════════════════════════════════════════════════════
+async function createStealthBrowser() {
+  const execPath = await sparticuzChromium.executablePath();
+  const ua = UAS[Math.floor(Math.random() * UAS.length)];
+  const w = 1280 + Math.floor(Math.random() * 320);
+  const h = 720 + Math.floor(Math.random() * 180);
+
+  const browser = await chromium.launch({
+    executablePath: execPath,
+    headless: true,
+    args: [
+      ...sparticuzChromium.args,
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-site-isolation-trials',
+      '--disable-web-security',
+      '--window-size=1600,900'
+    ]
+  });
+
+  const ctx = await browser.newContext({
+    userAgent: ua,
+    viewport: { width: w, height: h },
+    screen: { width: 1920, height: 1080 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    bypassCSP: true,
+    hasTouch: false,
+    isMobile: false,
+    deviceScaleFactor: 1,
+    javaScriptEnabled: true,
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"'
+    }
+  });
+
+  const page = await ctx.newPage();
+  await page.addInitScript(STEALTH_SCRIPT);
+  return { browser, page, ua };
+}
+
 async function scrapeKeyword(keyword, country) {
   let browser = null;
   const t0 = Date.now();
-  
+
   try {
-    const execPath = await sparticuzChromium.executablePath();
-    const ua = UAS[Math.floor(Math.random() * UAS.length)];
-    const w = 1200 + Math.floor(Math.random() * 400);
-    const h = 700 + Math.floor(Math.random() * 200);
+    const { browser: br, page } = await createStealthBrowser();
+    browser = br;
 
-    browser = await chromium.launch({
-      executablePath: execPath,
-      headless: true,
-      args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
-    });
-
-    const ctx = await browser.newContext({
-      userAgent: ua, viewport: { width: w, height: h },
-      locale: 'en-US', timezoneId: 'America/New_York', bypassCSP: true
-    });
-    const page = await ctx.newPage();
-
-    // Stealth
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    });
-
-    // Set up API response interceptor BEFORE navigation
+    // Intercept API responses
     let apiData = null;
     page.on('response', async (res) => {
-      if (res.url().includes('tools-backend.wordstream.com/api/free-tools/google/keywords') && res.status() === 200) {
+      const url = res.url();
+      if (url.includes('tools-backend.wordstream.com') && url.includes('keywords') && res.status() === 200) {
         try {
           const body = await res.json();
           if (body.keywords && body.keywords.length > 0) {
@@ -340,86 +454,193 @@ async function scrapeKeyword(keyword, country) {
       }
     });
 
-    // Step 1: Navigate directly to the React tool
-    console.log(`    [1/4] Navigate to tool...`);
-    await page.goto('https://tools.wordstream.com/fkt?website=test', { waitUntil: 'networkidle', timeout: 45000 });
-    await page.waitForTimeout(3000 + Math.random() * 2000);
+    // Block heavy resources to speed up
+    await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}', route => route.abort());
 
-    // Dismiss cookies via JS
-    await page.evaluate(() => { const b = document.getElementById('onetrust-accept-btn-handler'); if (b) b.click(); });
+    // Step 1: Go to WordStream keyword tool
+    console.log(`    [1/5] Navigate...`);
+    await page.goto('https://www.wordstream.com/keywords', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(4000 + Math.random() * 3000);
+
+    // Capture debug info
+    const debugInfo = await page.evaluate(() => {
+      return {
+        url: location.href,
+        title: document.title,
+        inputs: document.querySelectorAll('input').length,
+        visibleInputs: [...document.querySelectorAll('input')].filter(i => i.offsetWidth > 0).length,
+        buttons: document.querySelectorAll('button').length,
+        bodyText: document.body?.innerText?.substring(0, 500) || '',
+        hasRecaptcha: !!document.querySelector('[data-sitekey]') || !!window.grecaptcha,
+        iframes: document.querySelectorAll('iframe').length,
+        forms: document.querySelectorAll('form').length
+      };
+    });
+    console.log(`    [1/5] Page: ${debugInfo.url} | inputs:${debugInfo.visibleInputs} | btns:${debugInfo.buttons} | recaptcha:${debugInfo.hasRecaptcha}`);
+    lastDebugInfo = { ...debugInfo, keyword, timestamp: new Date().toISOString() };
+
+    // Dismiss cookies
+    await page.evaluate(() => {
+      const b = document.getElementById('onetrust-accept-btn-handler');
+      if (b) b.click();
+    });
     await page.waitForTimeout(1000);
 
-    // Step 2: Fill keyword + click Continue (ALL via page.evaluate)
-    console.log(`    [2/4] Fill keyword + Continue...`);
+    // Step 2: Find and fill the keyword input
+    console.log(`    [2/5] Fill keyword...`);
     const fillResult = await page.evaluate((kw) => {
-      // Find text input and fill keyword using React-compatible setter
-      const inputs = document.querySelectorAll('input[type="text"]');
-      let filled = false;
-      for (const inp of inputs) {
-        if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
-          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          nativeSetter.call(inp, kw);
-          inp.dispatchEvent(new Event('input', { bubbles: true }));
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
-          filled = true;
-          break;
+      // Try all possible input selectors
+      const selectors = [
+        'input[name="keyword"]', 'input[type="text"]', 'input[placeholder*="keyword" i]',
+        'input[placeholder*="enter" i]', 'input[id*="keyword" i]', 'input[class*="keyword" i]',
+        'input:not([type="hidden"]):not([type="submit"]):not([type="checkbox"])'
+      ];
+      for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        for (const inp of els) {
+          if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
+            inp.focus();
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(inp, kw);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }));
+            return { status: 'filled', selector: sel, tag: inp.tagName, name: inp.name || inp.id || '' };
+          }
         }
       }
-      return filled ? 'filled' : 'no-input-found';
+      return { status: 'no-input', selectors: selectors.length };
     }, keyword);
-    console.log(`    [2/4] Input: ${fillResult}`);
+    console.log(`    [2/5] Input: ${JSON.stringify(fillResult)}`);
+
+    if (fillResult.status === 'no-input') {
+      // Try going to tools.wordstream.com directly
+      console.log(`    [2/5] No input on main page — trying tools.wordstream.com...`);
+      await page.goto('https://tools.wordstream.com/fkt', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(5000);
+
+      const fill2 = await page.evaluate((kw) => {
+        const inputs = document.querySelectorAll('input:not([type="hidden"])');
+        for (const inp of inputs) {
+          if (inp.offsetWidth > 0) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(inp, kw);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return 'filled-tools';
+          }
+        }
+        return 'no-input-tools';
+      }, keyword);
+      console.log(`    [2/5] Tools page: ${fill2}`);
+    }
     await page.waitForTimeout(1000);
 
-    // Step 3: Click Continue/Search button
-    console.log(`    [3/4] Click Continue...`);
-    let clicked = false;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const result = await page.evaluate(() => {
-        const targets = ['Continue', 'CONTINUE', 'Search', 'SEARCH', 'Get Keywords', 'FIND MY KEYWORDS'];
-        const all = document.querySelectorAll('button, a, div[role="button"], input[type="submit"], span');
+    // Step 3: Submit/Search
+    console.log(`    [3/5] Click Search/Submit...`);
+    const clickResult = await page.evaluate(() => {
+      // Try submit buttons first
+      const submits = document.querySelectorAll('input[type="submit"], button[type="submit"]');
+      for (const s of submits) {
+        if (s.offsetWidth > 0) { s.click(); return 'submit-' + (s.value || s.textContent).trim().substring(0, 20); }
+      }
+      // Try buttons with search-like text
+      const targets = ['Search', 'Find', 'Get', 'Submit', 'Continue', 'FIND MY KEYWORDS'];
+      const btns = document.querySelectorAll('button, a.btn, div[role="button"], a[role="button"]');
+      for (const btn of btns) {
+        const txt = (btn.textContent || '').trim();
+        if (btn.offsetWidth > 0 && targets.some(t => txt.toUpperCase().includes(t.toUpperCase()))) {
+          btn.click();
+          return 'btn-' + txt.substring(0, 30);
+        }
+      }
+      // Try Enter on active input
+      const focused = document.activeElement;
+      if (focused && focused.tagName === 'INPUT') {
+        focused.form?.submit();
+        return 'form-submit';
+      }
+      return 'no-button';
+    });
+    console.log(`    [3/5] Click: ${clickResult}`);
+
+    // Also press Enter
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(8000 + Math.random() * 4000);
+
+    // Step 4: Check for redirect to tools.wordstream.com and handle Continue
+    console.log(`    [4/5] Handle results page...`);
+    const currentUrl = page.url();
+    console.log(`    [4/5] Current URL: ${currentUrl}`);
+
+    // Click Continue/Show Keywords if present
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (apiData) break;
+      const btn = await page.evaluate(() => {
+        const targets = ['Continue', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS', 'CONTINUE'];
+        const all = document.querySelectorAll('button, a, div[role="button"], span, input[type="submit"]');
         for (const el of all) {
           const txt = (el.textContent || el.value || '').trim();
           if (el.offsetWidth > 0 && el.offsetHeight > 0) {
             for (const t of targets) {
               if (txt.toUpperCase().includes(t.toUpperCase())) {
                 el.click();
-                return t;
+                return txt.substring(0, 30);
               }
             }
           }
         }
         return null;
       });
-      if (result) {
-        console.log(`    [3/4] ✅ Clicked: ${result} (attempt ${attempt+1})`);
-        clicked = true;
-        break;
-      }
-      await page.waitForTimeout(2000);
-    }
-    if (!clicked) {
-      console.log(`    [3/4] ⚠️ No button — trying Enter`);
-      await page.keyboard.press('Enter');
+      if (btn) console.log(`    [4/5] Clicked: ${btn} (attempt ${attempt+1})`);
+      await page.waitForTimeout(3000);
     }
 
-    // Step 4: Wait for API response to be intercepted
-    console.log(`    [4/4] Waiting for API response...`);
-    for (let i = 0; i < 30; i++) {
+    // Step 5: Wait for API intercept
+    console.log(`    [5/5] Waiting for data...`);
+    for (let i = 0; i < 20; i++) {
       if (apiData) break;
       await page.waitForTimeout(1000);
     }
 
-    // Retry Continue if no data yet
+    // If still no data, try direct API call from page context
     if (!apiData) {
-      console.log(`    [4/4] Retry — clicking Continue again...`);
-      await page.evaluate(() => {
-        document.querySelectorAll('button, a, div[role="button"]').forEach(el => {
-          if (el.offsetWidth > 0 && (el.textContent||'').includes('Continue')) el.click();
-        });
-      });
-      for (let i = 0; i < 20; i++) {
-        if (apiData) break;
-        await page.waitForTimeout(1000);
+      console.log(`    [5/5] No intercept — trying direct API from page context...`);
+      const directResult = await page.evaluate(async (kw) => {
+        try {
+          // Try to get reCAPTCHA token
+          let token = '';
+          if (window.grecaptcha && window.grecaptcha.execute) {
+            // Find site key
+            const el = document.querySelector('[data-sitekey]');
+            const siteKey = el?.getAttribute('data-sitekey') || '6LdIHAcTAAAAAPyJjCU5OP7NE4eHtG_DhsaI2CoA';
+            try {
+              token = await window.grecaptcha.execute(siteKey, { action: 'fkt' });
+            } catch(e) {
+              try { token = await window.grecaptcha.enterprise.execute(siteKey, { action: 'fkt' }); } catch(e2) {}
+            }
+          }
+
+          if (!token) return { status: 'no-recaptcha-token' };
+
+          const resp = await fetch('https://tools-backend.wordstream.com/api/free-tools/google/keywords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              keyword: kw, location_id: [2840], industry: 'all',
+              'g-recaptcha-response': token, source: 'fkt'
+            })
+          });
+          const data = await resp.json();
+          return { status: 'ok', count: data.keywords?.length || 0, data };
+        } catch(e) {
+          return { status: 'error', msg: e.message };
+        }
+      }, keyword);
+      console.log(`    [5/5] Direct API: ${JSON.stringify({ status: directResult.status, count: directResult.count || 0 })}`);
+      if (directResult.status === 'ok' && directResult.data?.keywords?.length > 0) {
+        apiData = directResult.data;
       }
     }
 
@@ -441,6 +662,7 @@ async function scrapeKeyword(keyword, country) {
     return { status: 'no_results', keyword, country: country.code, data: [], ms: Date.now() - t0 };
 
   } catch(err) {
+    console.log(`    ❌ Error: ${err.message.substring(0, 200)}`);
     return { status: 'error', keyword, country: country.code, data: [],
              error: err.message.substring(0, 150), ms: Date.now() - t0 };
   } finally {
@@ -592,6 +814,15 @@ app.get('/', (req, res) => {
 });
 
 app.get('/ping', (req, res) => res.send('pong'));
+
+app.get('/debug', (req, res) => {
+  res.json({
+    lastDebugInfo: lastDebugInfo || 'No scrape attempted yet',
+    stats, totalSearches, lastError,
+    help: 'This shows what the page looks like on Render'
+  });
+});
+
 app.get('/scrape', async (req, res) => { res.json(await scrapeNext()); });
 
 app.get('/results', (req, res) => {
