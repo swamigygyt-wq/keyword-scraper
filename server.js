@@ -340,80 +340,84 @@ async function scrapeKeyword(keyword, country) {
       }
     });
 
-    // Step 1: Navigate to WordStream main page and search
-    console.log(`    [1/5] Navigate + search...`);
-    await page.goto('https://www.wordstream.com/keywords', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000 + Math.random() * 2000);
+    // Step 1: Navigate directly to the React tool
+    console.log(`    [1/4] Navigate to tool...`);
+    await page.goto('https://tools.wordstream.com/fkt?website=test', { waitUntil: 'networkidle', timeout: 45000 });
+    await page.waitForTimeout(3000 + Math.random() * 2000);
 
-    // Dismiss cookies
+    // Dismiss cookies via JS
     await page.evaluate(() => { const b = document.getElementById('onetrust-accept-btn-handler'); if (b) b.click(); });
     await page.waitForTimeout(1000);
 
-    // Step 2: Type keyword
-    console.log(`    [2/5] Type keyword...`);
-    const input = page.locator('input[type="text"]').first();
-    await input.waitFor({ state: 'visible', timeout: 10000 });
-    await input.click();
-    // Type human-like
-    for (const ch of keyword) {
-      await input.type(ch, { delay: 30 + Math.random() * 50 });
-    }
-    await page.waitForTimeout(500 + Math.random() * 500);
+    // Step 2: Fill keyword + click Continue (ALL via page.evaluate)
+    console.log(`    [2/4] Fill keyword + Continue...`);
+    const fillResult = await page.evaluate((kw) => {
+      // Find text input and fill keyword using React-compatible setter
+      const inputs = document.querySelectorAll('input[type="text"]');
+      let filled = false;
+      for (const inp of inputs) {
+        if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
+          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(inp, kw);
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+          filled = true;
+          break;
+        }
+      }
+      return filled ? 'filled' : 'no-input-found';
+    }, keyword);
+    console.log(`    [2/4] Input: ${fillResult}`);
+    await page.waitForTimeout(1000);
 
-    // Step 3: Click Search/Submit
-    console.log(`    [3/5] Click Search...`);
-    try {
-      const submit = page.locator('input[type="submit"]').first();
-      if (await submit.isVisible({ timeout: 2000 })) await submit.click();
-      else await page.locator('button:has-text("Search")').first().click();
-    } catch(e) { await page.keyboard.press('Enter'); }
-
-    // Wait for redirect to tools.wordstream.com
-    await page.waitForTimeout(6000 + Math.random() * 3000);
-
-    // Step 4: Handle Refine/Continue modal
-    console.log(`    [4/5] Click Continue...`);
-    for (let attempt = 0; attempt < 8; attempt++) {
-      // Try clicking Continue via JS (works on any element type)
-      const clicked = await page.evaluate(() => {
-        const targets = ['Continue', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS'];
-        const all = document.querySelectorAll('button, a, div[role="button"], input[type="submit"]');
+    // Step 3: Click Continue/Search button
+    console.log(`    [3/4] Click Continue...`);
+    let clicked = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const result = await page.evaluate(() => {
+        const targets = ['Continue', 'CONTINUE', 'Search', 'SEARCH', 'Get Keywords', 'FIND MY KEYWORDS'];
+        const all = document.querySelectorAll('button, a, div[role="button"], input[type="submit"], span');
         for (const el of all) {
           const txt = (el.textContent || el.value || '').trim();
           if (el.offsetWidth > 0 && el.offsetHeight > 0) {
             for (const t of targets) {
-              if (txt.includes(t)) { el.click(); return t; }
+              if (txt.toUpperCase().includes(t.toUpperCase())) {
+                el.click();
+                return t;
+              }
             }
           }
         }
         return null;
       });
-      
-      if (clicked) {
-        console.log(`    [4/5] ✅ Clicked: ${clicked}`);
+      if (result) {
+        console.log(`    [3/4] ✅ Clicked: ${result} (attempt ${attempt+1})`);
+        clicked = true;
         break;
       }
       await page.waitForTimeout(2000);
     }
+    if (!clicked) {
+      console.log(`    [3/4] ⚠️ No button — trying Enter`);
+      await page.keyboard.press('Enter');
+    }
 
-    // Step 5: Wait for the API response to be intercepted
-    console.log(`    [5/5] Waiting for API response...`);
-    // Wait up to 20 seconds for the intercepted API response
-    for (let i = 0; i < 20; i++) {
+    // Step 4: Wait for API response to be intercepted
+    console.log(`    [4/4] Waiting for API response...`);
+    for (let i = 0; i < 30; i++) {
       if (apiData) break;
       await page.waitForTimeout(1000);
     }
 
-    // If still no API data, try clicking Continue again
+    // Retry Continue if no data yet
     if (!apiData) {
-      console.log(`    [5/5] Retry Continue...`);
+      console.log(`    [4/4] Retry — clicking Continue again...`);
       await page.evaluate(() => {
-        const all = document.querySelectorAll('button, a, div[role="button"]');
-        for (const el of all) {
-          if (el.offsetWidth > 0 && el.textContent.includes('Continue')) { el.click(); return; }
-        }
+        document.querySelectorAll('button, a, div[role="button"]').forEach(el => {
+          if (el.offsetWidth > 0 && (el.textContent||'').includes('Continue')) el.click();
+        });
       });
-      for (let i = 0; i < 15; i++) {
+      for (let i = 0; i < 20; i++) {
         if (apiData) break;
         await page.waitForTimeout(1000);
       }
