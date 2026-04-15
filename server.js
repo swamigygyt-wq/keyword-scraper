@@ -292,194 +292,155 @@ async function loadFromGist() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  BROWSER SESSION — Only for reCAPTCHA tokens
-// ═══════════════════════════════════════════════════════════════
-async function createBrowserSession() {
-  console.log('  🌐 Creating browser session for reCAPTCHA...');
-  
-  if (activeBrowser) {
-    try { await activeBrowser.close(); } catch(e) {}
-    activeBrowser = null;
-    activePage = null;
-  }
-  
-  const execPath = await sparticuzChromium.executablePath();
-  const ua = UAS[Math.floor(Math.random() * UAS.length)];
-  
-  activeBrowser = await chromium.launch({
-    executablePath: execPath,
-    headless: true,
-    args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
-  });
-  
-  const ctx = await activeBrowser.newContext({
-    userAgent: ua,
-    viewport: { width: 1366, height: 768 },
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-    bypassCSP: true
-  });
-  
-  activePage = await ctx.newPage();
-  
-  // Stealth
-  await activePage.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-  });
-  
-  // Navigate to WordStream tools page to load reCAPTCHA
-  await activePage.goto('https://tools.wordstream.com/fkt?website=test', {
-    waitUntil: 'networkidle', timeout: 45000
-  });
-  await activePage.waitForTimeout(3000);
-  
-  // Accept cookies
-  await activePage.evaluate(() => {
-    const btn = document.getElementById('onetrust-accept-btn-handler');
-    if (btn) btn.click();
-  });
-  await activePage.waitForTimeout(1000);
-  
-  tokenCount = 0;
-  console.log('  🌐 ✅ Browser session ready');
-}
-
-async function getRecaptchaToken() {
-  if (!activePage) await createBrowserSession();
-  
-  try {
-    // Execute reCAPTCHA v3 to get a fresh token
-    const token = await activePage.evaluate(() => {
-      return new Promise((resolve, reject) => {
-        if (typeof grecaptcha === 'undefined') {
-          reject(new Error('grecaptcha not loaded'));
-          return;
-        }
-        grecaptcha.ready(() => {
-          // Find the site key from the page
-          const siteKey = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') 
-            || document.querySelector('.g-recaptcha')?.getAttribute('data-sitekey')
-            || '6LdKVRcqAAAAAOiLRWz_1OkX5S3QA-M8uFfNnksp'; // fallback
-          
-          grecaptcha.execute(siteKey, { action: 'fkt_search' })
-            .then(token => resolve(token))
-            .catch(err => reject(err));
-        });
-      });
-    });
-    
-    tokenCount++;
-    return token;
-  } catch(err) {
-    console.log(`  ⚠️ reCAPTCHA failed: ${err.message} — recreating session`);
-    await createBrowserSession();
-    
-    // Retry once
-    try {
-      const token = await activePage.evaluate(() => {
-        return new Promise((resolve, reject) => {
-          if (typeof grecaptcha === 'undefined') {
-            reject(new Error('grecaptcha not loaded'));
-            return;
-          }
-          grecaptcha.ready(() => {
-            grecaptcha.execute(document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') || '6LdKVRcqAAAAAOiLRWz_1OkX5S3QA-M8uFfNnksp', { action: 'fkt_search' })
-              .then(resolve)
-              .catch(reject);
-          });
-        });
-      });
-      tokenCount++;
-      return token;
-    } catch(e) {
-      throw new Error(`reCAPTCHA failed after retry: ${e.message}`);
-    }
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  DIRECT API CALL — No UI interaction!
-// ═══════════════════════════════════════════════════════════════
-function callWordStreamAPI(keyword, locationIds, recaptchaToken) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ keyword, locationIds });
-    
-    const req = https.request('https://tools-backend.wordstream.com/api/free-tools/google/keywords', {
-      method: 'POST',
-      headers: {
-        'User-Agent': UAS[Math.floor(Math.random() * UAS.length)],
-        'Origin': 'https://tools.wordstream.com',
-        'Referer': 'https://tools.wordstream.com/',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'recaptcha': recaptchaToken,
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve({ status: res.statusCode, data: json });
-        } catch(e) {
-          resolve({ status: res.statusCode, data: data });
-        }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  CORE SCRAPER — Token + API call
+//  CORE SCRAPER — Intercept the React app's own API call
+//  Load page → fill keyword → click Continue → intercept response
+//  The app generates reCAPTCHA tokens FOR US!
 // ═══════════════════════════════════════════════════════════════
 async function scrapeKeyword(keyword, country) {
+  let browser = null;
   const t0 = Date.now();
   
   try {
-    // Step 1: Get reCAPTCHA token
-    console.log(`    [1/3] Get reCAPTCHA token...`);
-    const token = await getRecaptchaToken();
-    console.log(`    [1/3] ✅ Token (${token.substring(0, 20)}...)`);
-    
-    // Step 2: Call API directly
-    console.log(`    [2/3] Call API...`);
-    const locationIds = COUNTRY_LOCATIONS[country.code] || [2840];
-    const result = await callWordStreamAPI(keyword, locationIds, token);
-    
-    if (result.status !== 200) {
-      console.log(`    [2/3] ❌ API ${result.status}: ${JSON.stringify(result.data).substring(0, 200)}`);
-      return { status: 'error', keyword, country: country.code, data: [],
-               error: `API ${result.status}`, ms: Date.now() - t0 };
+    const execPath = await sparticuzChromium.executablePath();
+    const ua = UAS[Math.floor(Math.random() * UAS.length)];
+    const w = 1200 + Math.floor(Math.random() * 400);
+    const h = 700 + Math.floor(Math.random() * 200);
+
+    browser = await chromium.launch({
+      executablePath: execPath,
+      headless: true,
+      args: [...sparticuzChromium.args, '--disable-blink-features=AutomationControlled']
+    });
+
+    const ctx = await browser.newContext({
+      userAgent: ua, viewport: { width: w, height: h },
+      locale: 'en-US', timezoneId: 'America/New_York', bypassCSP: true
+    });
+    const page = await ctx.newPage();
+
+    // Stealth
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    });
+
+    // Set up API response interceptor BEFORE navigation
+    let apiData = null;
+    page.on('response', async (res) => {
+      if (res.url().includes('tools-backend.wordstream.com/api/free-tools/google/keywords') && res.status() === 200) {
+        try {
+          const body = await res.json();
+          if (body.keywords && body.keywords.length > 0) {
+            apiData = body;
+            console.log(`    📡 INTERCEPTED: ${body.keywords.length} keywords!`);
+          }
+        } catch(e) {}
+      }
+    });
+
+    // Step 1: Navigate to WordStream main page and search
+    console.log(`    [1/5] Navigate + search...`);
+    await page.goto('https://www.wordstream.com/keywords', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000 + Math.random() * 2000);
+
+    // Dismiss cookies
+    await page.evaluate(() => { const b = document.getElementById('onetrust-accept-btn-handler'); if (b) b.click(); });
+    await page.waitForTimeout(1000);
+
+    // Step 2: Type keyword
+    console.log(`    [2/5] Type keyword...`);
+    const input = page.locator('input[type="text"]').first();
+    await input.waitFor({ state: 'visible', timeout: 10000 });
+    await input.click();
+    // Type human-like
+    for (const ch of keyword) {
+      await input.type(ch, { delay: 30 + Math.random() * 50 });
     }
-    
-    // Step 3: Parse results
-    console.log(`    [3/3] Parse results...`);
-    const keywords = result.data.keywords || [];
-    const data = keywords.map(kw => ({
-      keyword: kw.keywordText,
-      volume: kw.searchVolume,
-      cpcLow: kw.lowTopPageBid,
-      cpcHigh: kw.highTopPageBid,
-      competition: kw.competition,
-      competitionIndex: kw.competitionIndex,
-      seed: keyword,
-      country: country.code
-    }));
-    
-    console.log(`    [3/3] ✅ ${data.length} keywords (${Math.round((Date.now()-t0)/1000)}s)`);
-    return { status: data.length > 0 ? 'ok' : 'no_results', keyword, country: country.code, 
-             data, ms: Date.now() - t0 };
-    
+    await page.waitForTimeout(500 + Math.random() * 500);
+
+    // Step 3: Click Search/Submit
+    console.log(`    [3/5] Click Search...`);
+    try {
+      const submit = page.locator('input[type="submit"]').first();
+      if (await submit.isVisible({ timeout: 2000 })) await submit.click();
+      else await page.locator('button:has-text("Search")').first().click();
+    } catch(e) { await page.keyboard.press('Enter'); }
+
+    // Wait for redirect to tools.wordstream.com
+    await page.waitForTimeout(6000 + Math.random() * 3000);
+
+    // Step 4: Handle Refine/Continue modal
+    console.log(`    [4/5] Click Continue...`);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // Try clicking Continue via JS (works on any element type)
+      const clicked = await page.evaluate(() => {
+        const targets = ['Continue', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS'];
+        const all = document.querySelectorAll('button, a, div[role="button"], input[type="submit"]');
+        for (const el of all) {
+          const txt = (el.textContent || el.value || '').trim();
+          if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+            for (const t of targets) {
+              if (txt.includes(t)) { el.click(); return t; }
+            }
+          }
+        }
+        return null;
+      });
+      
+      if (clicked) {
+        console.log(`    [4/5] ✅ Clicked: ${clicked}`);
+        break;
+      }
+      await page.waitForTimeout(2000);
+    }
+
+    // Step 5: Wait for the API response to be intercepted
+    console.log(`    [5/5] Waiting for API response...`);
+    // Wait up to 20 seconds for the intercepted API response
+    for (let i = 0; i < 20; i++) {
+      if (apiData) break;
+      await page.waitForTimeout(1000);
+    }
+
+    // If still no API data, try clicking Continue again
+    if (!apiData) {
+      console.log(`    [5/5] Retry Continue...`);
+      await page.evaluate(() => {
+        const all = document.querySelectorAll('button, a, div[role="button"]');
+        for (const el of all) {
+          if (el.offsetWidth > 0 && el.textContent.includes('Continue')) { el.click(); return; }
+        }
+      });
+      for (let i = 0; i < 15; i++) {
+        if (apiData) break;
+        await page.waitForTimeout(1000);
+      }
+    }
+
+    if (apiData && apiData.keywords) {
+      const data = apiData.keywords.map(kw => ({
+        keyword: kw.keywordText,
+        volume: kw.searchVolume,
+        cpcLow: kw.lowTopPageBid,
+        cpcHigh: kw.highTopPageBid,
+        competition: kw.competition,
+        competitionIndex: kw.competitionIndex,
+        seed: keyword,
+        country: country.code
+      }));
+      console.log(`    ✅ ${data.length} keywords (${Math.round((Date.now()-t0)/1000)}s)`);
+      return { status: 'ok', keyword, country: country.code, data, ms: Date.now() - t0 };
+    }
+
+    return { status: 'no_results', keyword, country: country.code, data: [], ms: Date.now() - t0 };
+
   } catch(err) {
     return { status: 'error', keyword, country: country.code, data: [],
              error: err.message.substring(0, 150), ms: Date.now() - t0 };
+  } finally {
+    if (browser) { try { await browser.close(); } catch(e) {} }
   }
 }
 
@@ -553,13 +514,6 @@ async function scrapeNext() {
     await saveToGist();
   }
   
-  // Browser rotation every 10 keywords
-  if (searchesSinceBrowserRotation >= 10) {
-    console.log(`  🔄 Rotating browser session...`);
-    await createBrowserSession();
-    searchesSinceBrowserRotation = 0;
-  }
-  
   isRunning = false;
   return {
     keyword, country: country.code, status: result.status,
@@ -571,14 +525,6 @@ async function scrapeNext() {
 // ═══ AUTO SCRAPE LOOP ═══
 async function autoScrapeLoop() {
   console.log('\n🟢 Auto-scrape loop started\n');
-  
-  // Create initial browser session
-  try {
-    await createBrowserSession();
-  } catch(err) {
-    console.log(`  ❌ Initial browser failed: ${err.message}`);
-    lastError = err.message;
-  }
   
   while (autoRunning) {
     if (!isRunning) {
