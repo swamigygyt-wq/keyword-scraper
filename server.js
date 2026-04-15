@@ -341,8 +341,7 @@ async function scrapeKeyword(keyword, country) {
     console.log(`    [3/8] Click Continue/Search...`);
     let buttonClicked = false;
     for (let attempt = 0; attempt < 8; attempt++) {
-      const clicked = await page.evaluate((countryLabel) => {
-        // Find ALL clickable elements with target text
+      const clicked = await page.evaluate(() => {
         const targets = ['Continue', 'CONTINUE', 'Search', 'SEARCH', 'Get Keywords', 'Show Keywords', 'FIND MY KEYWORDS'];
         const all = document.querySelectorAll('button, a, input[type="submit"], div[role="button"], span[role="button"]');
         
@@ -359,7 +358,6 @@ async function scrapeKeyword(keyword, country) {
           }
         }
         
-        // Also try: any orange/primary button
         const primaryBtns = document.querySelectorAll('button[class*="primary"], button[class*="continue"], button[class*="Submit"]');
         for (const btn of primaryBtns) {
           if (btn.offsetWidth > 0 && btn.offsetHeight > 0) {
@@ -369,7 +367,7 @@ async function scrapeKeyword(keyword, country) {
         }
         
         return null;
-      }, country.label);
+      });
       
       if (clicked) {
         console.log(`    [3/8] ✅ Clicked: ${clicked} (attempt ${attempt+1})`);
@@ -390,13 +388,13 @@ async function scrapeKeyword(keyword, country) {
     
     // The refine modal has keyword input + country + Continue
     // Fill keyword in modal input if empty, then click Continue
-    const modalResult = await page.evaluate((kw, countryLabel) => {
-      // Find all visible inputs and fill keyword if empty
+    const args = { kw: keyword, countryLabel: country.label };
+    const modalResult = await page.evaluate((args) => {
+      const { kw, countryLabel } = args;
       const inputs = document.querySelectorAll('input[type="text"]');
       for (const inp of inputs) {
         if (inp.offsetWidth > 0 && inp.offsetHeight > 0) {
           if (!inp.value || inp.value.trim() === '') {
-            // Use React-compatible value setter
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
             nativeInputValueSetter.call(inp, kw);
             inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -405,7 +403,6 @@ async function scrapeKeyword(keyword, country) {
         }
       }
       
-      // Try to select country in dropdowns
       const selects = document.querySelectorAll('select');
       for (const sel of selects) {
         const options = Array.from(sel.options);
@@ -418,7 +415,6 @@ async function scrapeKeyword(keyword, country) {
         }
       }
       
-      // Click Continue button (try all element types)
       const allEls = document.querySelectorAll('button, a, div[role="button"]');
       for (const el of allEls) {
         const txt = (el.textContent || '').trim();
@@ -429,7 +425,7 @@ async function scrapeKeyword(keyword, country) {
       }
       
       return 'no-continue-found';
-    }, keyword, country.label);
+    }, args);
     console.log(`    [4/8] Modal: ${modalResult}`);
 
     // ═══ STEP 5: Wait for keyword results to load ═══
