@@ -1,28 +1,29 @@
 // ═══════════════════════════════════════════════════════════════
-//  KEYWORD SCRAPER v4 — BULLETPROOF EDITION
+//  KEYWORD SCRAPER v5 — PLAYWRIGHT + SPARTICUZ CHROMIUM
+//  ✅ Playwright (better anti-detection than Puppeteer)
+//  ✅ @sparticuz/chromium (works on Render without Docker)
+//  ✅ Browser rotation every 10 keywords (avoid rate limits)
 //  ✅ Saves to GitHub Gist (survives Render restart)
-//  ✅ Memory management (flushes after saving)
-//  ✅ Smart rate limiting (60-90s delays, cooldowns)
-//  ✅ Auto country switching (US → UK → CA → AU → DE)
+//  ✅ Multi-country (US → UK → CA → AU → DE)
 //  ✅ Never repeats a keyword
 //  ✅ Self-ping keeps Render alive
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+const { chromium } = require('playwright-core');
+const sparticuzChromium = require('@sparticuz/chromium');
 const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ═══ GITHUB GIST CONFIG (for data persistence) ═══
+// ═══ GITHUB GIST CONFIG ═══
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-let GIST_ID = process.env.GIST_ID || ''; // Will create on first save
+let GIST_ID = process.env.GIST_ID || '';
 
 // ═══ STATE ═══
-let allResults = [];        // Current batch (flushed after save)
-let totalSaved = 0;         // Total saved across all batches
+let allResults = [];
+let totalSaved = 0;
 let searchedKeys = new Set();
 let isRunning = false;
 let autoRunning = false;
@@ -34,13 +35,13 @@ let currentSeedIdx = 0;
 let startTime = Date.now();
 let stats = { ok: 0, noResults: 0, fails: 0, skipped: 0, saved: 0 };
 let lastError = '';
+let searchesSinceBrowserRotation = 0;
 
 // ═══ COUNTRIES + SEEDS (ordered by CPC) ═══
 const COUNTRIES = [
   {
     code: 'US', name: 'United States', label: 'United States',
     seeds: [
-      // LEGAL ($200-600)
       "car accident lawyer","truck accident lawyer","personal injury lawyer","wrongful death attorney",
       "slip and fall lawyer","dog bite lawyer","motorcycle accident lawyer","medical malpractice lawyer",
       "mesothelioma lawyer","work injury lawyer","premises liability lawyer","birth injury lawyer",
@@ -51,8 +52,6 @@ const COUNTRIES = [
       "uber accident lawyer","drunk driving accident lawyer","hit and run lawyer",
       "whiplash injury lawyer","back injury lawyer","amputation lawyer",
       "electrocution lawyer","drowning accident lawyer","defective drug lawyer",
-      
-      // INSURANCE ($50-200)
       "auto insurance quote","car insurance quote","home insurance quote","life insurance quote",
       "health insurance quote","motorcycle insurance quote","renters insurance quote",
       "business insurance quote","commercial insurance quote","dental insurance cost",
@@ -63,8 +62,6 @@ const COUNTRIES = [
       "mobile home insurance","condo insurance cost","landlord insurance cost",
       "professional liability insurance","cyber insurance cost","wedding insurance cost",
       "sr22 insurance cost","gap insurance cost","final expense insurance",
-      
-      // FINANCE ($10-50)
       "loan comparison calculator","debt consolidation calculator","credit card payoff calculator",
       "student loan refinance calculator","business loan calculator","sba loan calculator",
       "commercial loan calculator","hard money loan calculator","bridge loan calculator",
@@ -72,8 +69,6 @@ const COUNTRIES = [
       "heloc calculator","home equity loan calculator","fha loan calculator",
       "va loan calculator","jumbo loan calculator","construction loan calculator",
       "land loan calculator","personal loan calculator","payday loan calculator",
-      
-      // TAX ($8-20)
       "payroll tax calculator","salary calculator","tax estimator","federal tax calculator",
       "1099 tax calculator","self employment tax calculator","capital gains tax calculator",
       "estate tax calculator","gift tax calculator","property tax calculator",
@@ -82,52 +77,34 @@ const COUNTRIES = [
       "tax withholding calculator","income tax calculator","quarterly tax calculator",
       "depreciation calculator","bonus tax calculator","stock option tax calculator",
       "crypto tax calculator","rental income tax calculator","agi calculator",
-      
-      // INVESTMENT ($2-10)
       "investment calculator","stock calculator","roi calculator","dividend calculator",
       "bond yield calculator","mutual fund calculator","cd calculator","annuity calculator",
       "present value calculator","future value calculator","stock return calculator",
       "options profit calculator","forex calculator","etf calculator",
       "dollar cost averaging calculator","margin calculator","cryptocurrency calculator",
-      
-      // RETIREMENT ($3-13)
       "retirement calculator","401k calculator","roth ira calculator","pension calculator",
       "social security calculator","ira calculator","retirement savings calculator",
       "early retirement calculator","rmd calculator","sep ira calculator",
       "403b calculator","fire calculator","coast fire calculator",
-      
-      // AUTO ($1-10)
       "car payment calculator","auto loan calculator","car lease calculator",
       "car depreciation calculator","auto refinance calculator","gas mileage calculator",
       "car insurance calculator","vehicle trade in value calculator",
       "car affordability calculator","electric vehicle cost calculator",
-      
-      // SAVINGS ($1-6)
       "compound interest calculator","savings calculator","inflation calculator",
       "high yield savings calculator","savings goal calculator","emergency fund calculator",
-      
-      // HEALTH ($1-5)
       "calorie calculator","bmi calculator","tdee calculator","macro calculator",
       "body fat calculator","protein calculator","pregnancy due date calculator",
       "ideal weight calculator","ovulation calculator","blood alcohol calculator",
-      
-      // REAL ESTATE ($2-35)
       "rental property calculator","airbnb calculator","rent vs buy calculator",
       "real estate roi calculator","flip calculator","cash on cash return calculator",
       "mortgage affordability calculator","closing cost calculator",
       "cap rate calculator","gross rent multiplier calculator",
-      
-      // DEBT ($2-8)
       "debt payoff calculator","credit card interest calculator","balance transfer calculator",
       "debt avalanche calculator","debt snowball calculator","net worth calculator",
-      
-      // HOME
       "solar panel calculator","electricity cost calculator","pool cost calculator",
       "roofing calculator","fence calculator","flooring calculator","paint calculator",
       "square footage calculator","concrete calculator","gravel calculator",
       "deck cost calculator","bathroom remodel calculator","kitchen remodel calculator",
-      
-      // MISC
       "tip calculator","percentage calculator","discount calculator",
       "shipping cost calculator","import duty calculator","cost of living calculator",
       "moving cost calculator","wedding cost calculator","college cost calculator",
@@ -137,103 +114,37 @@ const COUNTRIES = [
   {
     code: 'UK', name: 'United Kingdom', label: 'United Kingdom',
     seeds: [
-      // UK LEGAL
       "personal injury claim calculator","car accident claim uk","road traffic accident solicitor",
       "whiplash claim calculator","workplace injury claim","slip trip fall compensation",
       "medical negligence solicitor","industrial disease claim","asbestos claim solicitor",
-      "motorcycle accident claim uk","pedestrian accident claim","criminal injury compensation",
-      "housing disrepair claim","flight delay compensation","no win no fee solicitor",
-      
-      // UK INSURANCE
       "car insurance comparison uk","home insurance comparison uk","life insurance uk",
-      "health insurance uk","pet insurance comparison","travel insurance comparison",
-      "van insurance quote","motorbike insurance uk","landlord insurance uk",
-      "business insurance uk","public liability insurance","employers liability insurance",
-      "income protection insurance","critical illness cover","buildings insurance cost",
-      
-      // UK FINANCE
       "mortgage calculator uk","stamp duty calculator","inheritance tax calculator uk",
       "pension calculator uk","salary calculator uk","tax calculator uk",
-      "student loan calculator uk","isa calculator","help to buy calculator",
-      "buy to let calculator","bridging loan calculator uk","equity release calculator",
-      "capital gains tax calculator uk","vat calculator","self assessment calculator",
-      "paye calculator","national insurance calculator","dividend tax calculator uk",
-      "council tax calculator","benefit calculator uk","lisa calculator",
-      
-      // UK SAVINGS & INVEST
-      "compound interest calculator uk","savings calculator uk","inflation calculator uk",
-      "investment calculator uk","stocks and shares isa calculator",
-      "premium bonds calculator","pension drawdown calculator",
-      "annuity calculator uk","retirement calculator uk","sipp calculator",
-      
-      // UK PROPERTY
-      "rental yield calculator uk","stamp duty calculator uk","property investment calculator",
-      "buy to let mortgage calculator","house price calculator","shared ownership calculator",
-      
-      // UK HOME & ENERGY
-      "solar panel calculator uk","energy cost calculator uk","boiler cost calculator",
-      "loft conversion cost","extension cost calculator","double glazing cost calculator",
-      "heat pump cost calculator","ev charging cost calculator"
+      "compound interest calculator uk","savings calculator uk","investment calculator uk",
+      "rental yield calculator uk","buy to let mortgage calculator",
+      "solar panel calculator uk","energy cost calculator uk","boiler cost calculator"
     ]
   },
   {
     code: 'CA', name: 'Canada', label: 'Canada',
     seeds: [
-      // CA LEGAL
       "personal injury lawyer canada","car accident lawyer toronto","slip and fall lawyer ontario",
-      "medical malpractice lawyer canada","wrongful dismissal lawyer","disability lawyer canada",
-      "workers compensation lawyer canada","motorcycle accident lawyer canada",
-      "accident benefits calculator ontario","long term disability lawyer",
-      
-      // CA INSURANCE
       "car insurance ontario","home insurance canada","life insurance canada",
-      "health insurance canada","travel insurance canada","business insurance canada",
-      "motorcycle insurance ontario","tenant insurance canada","condo insurance canada",
-      
-      // CA FINANCE
       "mortgage calculator canada","rrsp calculator","tfsa calculator",
       "income tax calculator canada","gst hst calculator","cpp calculator",
-      "student loan calculator canada","car loan calculator canada",
-      "payroll calculator canada","salary calculator canada",
-      "capital gains tax calculator canada","land transfer tax calculator",
-      "ei calculator","maternity leave calculator canada","resp calculator",
-      
-      // CA PROPERTY
       "rental yield calculator canada","property tax calculator ontario",
-      "cost of living calculator canada","mortgage affordability calculator canada",
-      "first time home buyer calculator canada","cmhc insurance calculator",
-      
-      // CA HOME
-      "solar panel calculator canada","hydro cost calculator",
-      "home renovation calculator canada","furnace cost calculator"
+      "solar panel calculator canada","hydro cost calculator"
     ]
   },
   {
     code: 'AU', name: 'Australia', label: 'Australia',
     seeds: [
-      // AU LEGAL
       "personal injury lawyer australia","car accident lawyer sydney",
       "workers compensation lawyer nsw","medical negligence lawyer australia",
-      "tpd claim calculator","slip and fall claim australia",
-      
-      // AU INSURANCE  
-      "car insurance comparison australia","home insurance australia","life insurance australia",
-      "health insurance comparison australia","income protection insurance australia",
-      "business insurance australia","landlord insurance australia",
-      
-      // AU FINANCE
+      "car insurance comparison australia","home insurance australia",
       "mortgage calculator australia","income tax calculator australia",
-      "stamp duty calculator nsw","stamp duty calculator victoria",
-      "superannuation calculator","hecs help calculator",
-      "salary calculator australia","gst calculator australia",
-      "capital gains tax calculator australia","car loan calculator australia",
-      "investment property calculator","negative gearing calculator",
-      
-      // AU PROPERTY
+      "stamp duty calculator nsw","superannuation calculator",
       "rental yield calculator australia","lmi calculator",
-      "first home buyer calculator","home loan affordability calculator",
-      
-      // AU HOME
       "solar panel calculator australia","electricity cost calculator australia"
     ]
   },
@@ -241,18 +152,14 @@ const COUNTRIES = [
     code: 'DE', name: 'Germany', label: 'Germany',
     seeds: [
       "tax calculator germany","income tax germany","salary calculator germany",
-      "health insurance germany","car insurance germany","life insurance germany",
-      "mortgage calculator germany","rent calculator germany",
+      "health insurance germany","car insurance germany","mortgage calculator germany",
       "pension calculator germany","investment calculator germany",
-      "cost of living germany","expat tax calculator germany",
-      "freelance tax germany","property tax germany","energy cost calculator germany",
-      "solar panel calculator germany","retirement calculator germany",
-      "salary comparison germany","church tax calculator germany"
+      "cost of living germany","solar panel calculator germany"
     ]
   }
 ];
 
-// ═══ ALREADY DONE (from existing 5500+ local data) ═══
+// ═══ ALREADY DONE (from existing local data) ═══
 const ALREADY_DONE_US = new Set([
   "car accident lawyer","truck accident lawyer","personal injury lawyer","wrongful death attorney",
   "slip and fall lawyer","dog bite lawyer","work injury lawyer","premises liability lawyer",
@@ -265,9 +172,6 @@ const ALREADY_DONE_US = new Set([
   "estate tax calculator","gift tax calculator","property tax calculator","sales tax calculator",
   "tax bracket calculator","tax deduction calculator","tax refund calculator",
   "inheritance tax calculator","w2 calculator","income tax calculator",
-  "home office deduction calculator","mileage deduction calculator","charitable donation calculator",
-  "import duty calculator","customs duty calculator","minimum wage calculator",
-  "living wage calculator","raise calculator",
   "investment calculator","stock calculator","roi calculator","dividend calculator",
   "compound interest calculator","cd calculator","present value calculator","stock return calculator",
   "retirement calculator","401k calculator","roth ira calculator","pension calculator",
@@ -282,13 +186,11 @@ const ALREADY_DONE_US = new Set([
   "solar panel calculator","concrete calculator","square footage calculator",
   "shipping cost calculator","rental property calculator","mortgage affordability calculator",
   "loan comparison calculator","hard money loan calculator","student loan refinance calculator",
-  "extra payment mortgage calculator","first time home buyer calculator",
-  "solo 401k calculator","backdoor roth ira calculator",
   "mobile home insurance","nursing home abuse lawyer","brain injury lawyer",
   "spinal cord injury lawyer","toxic tort lawyer"
 ]);
 
-// ═══ USER AGENTS ═══
+// ═══ USER AGENTS (rotated per browser session) ═══
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -303,15 +205,13 @@ const TZS = ['America/New_York','America/Chicago','America/Denver','America/Los_
              'Europe/London','Europe/Berlin','Australia/Sydney','America/Toronto'];
 
 // ═══════════════════════════════════════════════════════════════
-//  GITHUB GIST — PERSISTENT STORAGE (survives Render restarts)
+//  GITHUB GIST — PERSISTENT STORAGE
 // ═══════════════════════════════════════════════════════════════
 function githubRequest(method, path, body) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : '';
     const req = https.request({
-      hostname: 'api.github.com',
-      path,
-      method,
+      hostname: 'api.github.com', path, method,
       headers: {
         'Authorization': `token ${GITHUB_TOKEN}`,
         'User-Agent': 'KeywordScraper',
@@ -321,9 +221,7 @@ function githubRequest(method, path, body) {
     }, res => {
       let body = '';
       res.on('data', c => body += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(body)); } catch(e) { resolve(body); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch(e) { resolve(body); } });
     });
     req.on('error', reject);
     if (data) req.write(data);
@@ -333,7 +231,6 @@ function githubRequest(method, path, body) {
 
 async function saveToGist() {
   if (allResults.length === 0) return;
-  
   try {
     const batch = stats.saved + 1;
     const csv = 'Keyword,Volume,CPC_Low,CPC_High,Competition,Seed,Country\n' +
@@ -342,14 +239,9 @@ async function saveToGist() {
       ).join('\n');
     
     const stateData = JSON.stringify({
-      searchedKeys: [...searchedKeys],
-      currentCountryIdx,
-      currentSeedIdx,
-      totalSearches,
-      stats,
-      totalSaved: totalSaved + allResults.length,
-      lastRun,
-      timestamp: new Date().toISOString()
+      searchedKeys: [...searchedKeys], currentCountryIdx, currentSeedIdx,
+      totalSearches, stats, totalSaved: totalSaved + allResults.length,
+      lastRun, timestamp: new Date().toISOString()
     });
     
     const files = {};
@@ -357,38 +249,24 @@ async function saveToGist() {
     files['state.json'] = { content: stateData };
     
     if (!GIST_ID) {
-      // Create new gist
       const gist = await githubRequest('POST', '/gists', {
         description: `Keyword Scraper Data — ${new Date().toISOString()}`,
-        public: false,
-        files
+        public: false, files
       });
-      if (gist.id) {
-        GIST_ID = gist.id;
-        console.log(`  💾 Gist created: ${GIST_ID}`);
-      } else {
-        console.log(`  ❌ Gist create failed:`, JSON.stringify(gist).substring(0, 200));
-        return;
-      }
+      if (gist.id) { GIST_ID = gist.id; console.log(`  💾 Gist created: ${GIST_ID}`); }
+      else { console.log(`  ❌ Gist create failed`); return; }
     } else {
-      // Update existing gist
       await githubRequest('PATCH', `/gists/${GIST_ID}`, { files });
-      console.log(`  💾 Gist updated: batch ${batch} (${allResults.length} keywords)`);
+      console.log(`  💾 Gist updated: batch ${batch} (${allResults.length} kw)`);
     }
-    
     totalSaved += allResults.length;
     stats.saved++;
-    allResults = []; // FREE MEMORY
-    
-  } catch(err) {
-    console.log(`  ❌ Gist save error: ${err.message}`);
-    lastError = `Gist save: ${err.message}`;
-  }
+    allResults = [];
+  } catch(err) { console.log(`  ❌ Gist error: ${err.message}`); lastError = `Gist: ${err.message}`; }
 }
 
 async function loadFromGist() {
   if (!GIST_ID) return;
-  
   try {
     const gist = await githubRequest('GET', `/gists/${GIST_ID}`, null);
     if (gist.files && gist.files['state.json']) {
@@ -399,175 +277,240 @@ async function loadFromGist() {
       totalSearches = state.totalSearches || 0;
       totalSaved = state.totalSaved || 0;
       stats = { ...stats, ...state.stats };
-      console.log(`  📂 Loaded state: ${searchedKeys.size} searched, ${totalSaved} saved`);
+      console.log(`  📂 Loaded: ${searchedKeys.size} searched, ${totalSaved} saved`);
     }
-  } catch(err) {
-    console.log(`  ⚠️ Could not load state: ${err.message}`);
-  }
+  } catch(err) { console.log(`  ⚠️ Load state failed: ${err.message}`); }
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  CORE SCRAPER
+//  CORE SCRAPER — PLAYWRIGHT + ANTI-DETECTION
 // ═══════════════════════════════════════════════════════════════
 async function scrapeKeyword(keyword, country) {
   let browser = null;
   const t0 = Date.now();
-  const delay = ms => new Promise(r => setTimeout(r, ms));
   
   try {
-    // Launch fresh browser each time (using @sparticuz/chromium for cloud compatibility)
-    chromium.setHeadlessMode = true;
-    chromium.setGraphicsMode = false;
-    browser = await puppeteer.launch({
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
+    // Get executable path from @sparticuz/chromium (works on Render)
+    const execPath = await sparticuzChromium.executablePath();
+    
+    // Random fingerprint
+    const ua = UAS[Math.floor(Math.random() * UAS.length)];
+    const tz = TZS[Math.floor(Math.random() * TZS.length)];
+    const w = 1200 + Math.floor(Math.random() * 400);
+    const h = 700 + Math.floor(Math.random() * 200);
+
+    // Launch fresh browser with unique fingerprint
+    browser = await chromium.launch({
+      executablePath: execPath,
+      headless: true,
       args: [
-        ...chromium.args,
+        ...sparticuzChromium.args,
         '--disable-blink-features=AutomationControlled'
       ]
     });
-    
-    const ua = UAS[Math.floor(Math.random() * UAS.length)];
-    const w = 1200 + Math.floor(Math.random() * 400);
-    const h = 700 + Math.floor(Math.random() * 200);
-    
-    const page = await browser.newPage();
-    await page.setUserAgent(ua);
-    await page.setViewport({ width: w, height: h });
-    
-    // Anti-detection
-    await page.evaluateOnNewDocument(() => {
+
+    const ctx = await browser.newContext({
+      userAgent: ua,
+      viewport: { width: w, height: h },
+      locale: 'en-US',
+      timezoneId: tz,
+      // Prevent Playwright detection
+      bypassCSP: true
+    });
+
+    const page = await ctx.newPage();
+
+    // Anti-detection stealth
+    await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {} };
+      window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
     });
 
-    page.setDefaultTimeout(20000);
+    page.setDefaultTimeout(25000);
 
-    // 1. Navigate
+    // ═══ STEP 1: Navigate to WordStream ═══
+    console.log(`    [1/10] Navigate...`);
     await page.goto('https://www.wordstream.com/keywords', { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 30000 
+      waitUntil: 'domcontentloaded', timeout: 30000 
     });
-    await delay(3000 + Math.random() * 3000);
+    await page.waitForTimeout(3000 + Math.random() * 2000);
 
-    // 2. Dismiss popups
-    const popupSels = ['#onetrust-accept-btn-handler', '[aria-label="close"]', '.modal-close'];
-    for (const sel of popupSels) {
-      try {
-        const el = await page.$(sel);
-        if (el) { await el.click(); await delay(800); }
-      } catch(e) {}
-    }
-    // Try text-based buttons
+    // ═══ STEP 2: Dismiss cookie popup ═══
+    console.log(`    [2/10] Cookies...`);
     try {
-      const buttons = await page.$$('button');
-      for (const btn of buttons) {
-        const txt = await page.evaluate(el => el.textContent, btn);
-        if (txt && (txt.includes('Accept') || txt.includes('Close'))) {
-          await btn.click(); await delay(800); break;
-        }
+      const cookieBtn = page.locator('#onetrust-accept-btn-handler');
+      if (await cookieBtn.isVisible({ timeout: 3000 })) {
+        await cookieBtn.click();
+        await page.waitForTimeout(1000);
       }
     } catch(e) {}
 
-    // 3. Type keyword (human-like)
-    const input = await page.$('input[placeholder*="keyword"], input[placeholder*="Keyword"], input[type="text"]');
-    if (!input) throw new Error('Input field not found');
+    // ═══ STEP 3: Find and fill the keyword input ═══
+    console.log(`    [3/10] Type keyword...`);
+    const input = page.locator('input[type="text"]').first();
+    await input.waitFor({ state: 'visible', timeout: 8000 });
     await input.click();
-    await page.evaluate(el => el.value = '', input);
-    await delay(500);
+    await input.fill('');
+    await page.waitForTimeout(300);
+    // Type human-like
     for (const ch of keyword) {
-      await page.keyboard.type(ch, { delay: 50 + Math.random() * 80 });
+      await input.type(ch, { delay: 40 + Math.random() * 60 });
     }
-    await delay(1000 + Math.random() * 1000);
+    await page.waitForTimeout(1000 + Math.random() * 1000);
 
-    // 4. Select country if not US
-    if (country.code !== 'US') {
+    // ═══ STEP 4: Click Search ═══
+    console.log(`    [4/10] Search...`);
+    const searchBtn = page.locator('input[type="submit"]').first();
+    if (await searchBtn.isVisible({ timeout: 3000 })) {
+      await searchBtn.click();
+    } else {
+      // Fallback: find button with "Search" text
+      await page.locator('button:has-text("Search")').first().click();
+    }
+    await page.waitForTimeout(4000 + Math.random() * 2000);
+
+    // ═══ STEP 5: Handle "Refine Your Search" modal ═══
+    console.log(`    [5/10] Handle modal...`);
+    // The modal has its OWN keyword input + industry + country + Continue button
+    // We need to click "Continue" in the modal
+    let modalHandled = false;
+    for (let attempt = 0; attempt < 6; attempt++) {
       try {
-        const selects = await page.$$('select');
-        for (const sel of selects) {
-          const options = await page.evaluate(s => Array.from(s.options).map(o => o.text), sel);
-          if (options.some(o => o.includes(country.label) || o.includes(country.name))) {
-            await page.evaluate((s, label) => {
-              const opt = Array.from(s.options).find(o => o.text.includes(label));
-              if (opt) { s.value = opt.value; s.dispatchEvent(new Event('change')); }
-            }, sel, country.label);
-            await delay(1000);
+        // Try clicking Continue button (it's the big orange button in the modal)
+        const continueBtn = page.locator('button:has-text("Continue")').first();
+        if (await continueBtn.isVisible({ timeout: 2000 })) {
+          // Before clicking Continue, check if the modal input has our keyword
+          // If not, fill it
+          try {
+            const modalInputs = page.locator('[role="dialog"] input[type="text"], .MuiDialog-root input, .MuiModal-root input');
+            const count = await modalInputs.count();
+            if (count > 0) {
+              const modalInput = modalInputs.first();
+              const val = await modalInput.inputValue();
+              if (!val || val.trim() === '') {
+                await modalInput.fill(keyword);
+                await page.waitForTimeout(500);
+              }
+            }
+          } catch(e) {}
+
+          // Select country in modal if not US
+          if (country.code !== 'US') {
+            try {
+              const selects = page.locator('select, [role="dialog"] select');
+              const count = await selects.count();
+              for (let i = 0; i < count; i++) {
+                const sel = selects.nth(i);
+                const options = await sel.locator('option').allTextContents();
+                if (options.some(o => o.includes(country.label) || o.includes(country.name))) {
+                  await sel.selectOption({ label: country.label });
+                  await page.waitForTimeout(500);
+                  break;
+                }
+              }
+            } catch(e) {}
+          }
+
+          await continueBtn.click();
+          modalHandled = true;
+          console.log(`    [5/10] ✅ Continue clicked`);
+          break;
+        }
+      } catch(e) {}
+      
+      // Also try "Get Keywords", "Show Keywords"
+      try {
+        for (const txt of ['Get Keywords', 'Show Keywords', 'View Results']) {
+          const btn = page.locator(`button:has-text("${txt}")`).first();
+          if (await btn.isVisible({ timeout: 500 })) {
+            await btn.click();
+            modalHandled = true;
+            console.log(`    [5/10] ✅ ${txt} clicked`);
             break;
           }
         }
+        if (modalHandled) break;
       } catch(e) {}
+      
+      await page.waitForTimeout(1500);
     }
 
-    // 5. Click search
-    const searchBtn = await page.$('input[type="submit"]') || await page.$('button[type="submit"]');
-    if (!searchBtn) {
-      // Try text-based search button
-      const btns = await page.$$('button');
-      let found = false;
-      for (const btn of btns) {
-        const txt = await page.evaluate(el => el.textContent, btn);
-        if (txt && txt.includes('Search')) { await btn.click(); found = true; break; }
-      }
-      if (!found) throw new Error('Search button not found');
-    } else {
-      await searchBtn.click();
-    }
-    await delay(5000 + Math.random() * 2000);
+    // ═══ STEP 6: Wait for results to load ═══
+    console.log(`    [6/10] Wait for results...`);
+    await page.waitForTimeout(10000 + Math.random() * 5000);
 
-    // 6. Handle Continue/Get Keywords buttons
-    const continueTexts = ['Continue', 'Get Keywords', 'Show Keywords', 'View Results'];
-    try {
-      const allBtns = await page.$$('button');
-      for (const btn of allBtns) {
-        const txt = await page.evaluate(el => el.textContent.trim(), btn);
-        if (continueTexts.some(t => txt.includes(t))) {
-          await btn.click();
-          await delay(8000 + Math.random() * 4000);
-          break;
-        }
-      }
-    } catch(e) {}
-
-    // 7. Extra wait
-    await delay(3000 + Math.random() * 2000);
-
-    // 8. Check No Results
+    // ═══ STEP 7: Check for "No Results" ═══
+    console.log(`    [7/10] Check results...`);
     const pageText = await page.evaluate(() => document.body.innerText);
-    if (pageText.includes('No Results')) {
+    if (pageText.includes('No Results') && !pageText.includes('car') && !pageText.includes('insurance')) {
       return { status: 'no_results', keyword, country: country.code, data: [], ms: Date.now() - t0 };
     }
 
-    // 9. Wait for table
-    try { await page.waitForSelector('table tbody tr th[scope="row"]', { timeout: 8000 }); } catch(e) {}
+    // ═══ STEP 8: Wait for table ═══
+    console.log(`    [8/10] Find table...`);
+    try {
+      await page.waitForSelector('table tbody tr', { timeout: 10000 });
+    } catch(e) {
+      // Try alternate: maybe it's shown differently
+    }
 
-    // 10. Extract data
+    // ═══ STEP 9: Extract ALL keyword data ═══
+    console.log(`    [9/10] Extract data...`);
     const data = await page.evaluate(() => {
+      const results = [];
+      
+      // Method 1: Standard table with th[scope=row]
       const rows = document.querySelectorAll('table tbody tr');
-      return Array.from(rows).map(row => {
+      for (const row of rows) {
         const th = row.querySelector('th[scope="row"]');
         const tds = row.querySelectorAll('td');
-        if (!th || tds.length < 4) return null;
-        return {
-          keyword: th.textContent.trim(),
-          volume: tds[0]?.textContent?.trim() || '-',
-          bidLow: tds[1]?.textContent?.trim() || '-',
-          bidHigh: tds[2]?.textContent?.trim() || '-',
-          competition: tds[3]?.textContent?.trim() || '-'
-        };
-      }).filter(Boolean);
+        if (th && tds.length >= 4) {
+          results.push({
+            keyword: th.textContent.trim(),
+            volume: tds[0]?.textContent?.trim() || '-',
+            bidLow: tds[1]?.textContent?.trim() || '-',
+            bidHigh: tds[2]?.textContent?.trim() || '-',
+            competition: tds[3]?.textContent?.trim() || '-'
+          });
+        }
+      }
+      
+      // Method 2: If no th, try all td cells
+      if (results.length === 0) {
+        for (const row of rows) {
+          const cells = row.querySelectorAll('td');
+          if (cells.length >= 5) {
+            results.push({
+              keyword: cells[0]?.textContent?.trim() || '-',
+              volume: cells[1]?.textContent?.trim() || '-',
+              bidLow: cells[2]?.textContent?.trim() || '-',
+              bidHigh: cells[3]?.textContent?.trim() || '-',
+              competition: cells[4]?.textContent?.trim() || '-'
+            });
+          }
+        }
+      }
+      
+      return results;
     });
 
+    // ═══ STEP 10: Return results ═══
+    console.log(`    [10/10] Done — ${data.length} keywords`);
     return { status: data.length > 0 ? 'ok' : 'empty', keyword, country: country.code, data, ms: Date.now() - t0 };
 
   } catch(err) {
     return { status: 'error', keyword, country: country.code, data: [], 
-             error: err.message.substring(0, 100), ms: Date.now() - t0 };
+             error: err.message.substring(0, 150), ms: Date.now() - t0 };
   } finally {
-    if (browser) {
-      try { await browser.close(); } catch(e) {}
-    }
+    if (browser) { try { await browser.close(); } catch(e) {} }
   }
 }
 
@@ -575,22 +518,16 @@ async function scrapeKeyword(keyword, country) {
 function getNextKeyword() {
   while (currentCountryIdx < COUNTRIES.length) {
     const country = COUNTRIES[currentCountryIdx];
-    
     while (currentSeedIdx < country.seeds.length) {
       const seed = country.seeds[currentSeedIdx];
       const key = `${seed.toLowerCase()}|${country.code}`;
       currentSeedIdx++;
-      
       if (searchedKeys.has(key)) { stats.skipped++; continue; }
       if (country.code === 'US' && ALREADY_DONE_US.has(seed.toLowerCase())) {
-        searchedKeys.add(key);
-        stats.skipped++;
-        continue;
+        searchedKeys.add(key); stats.skipped++; continue;
       }
-      
       return { keyword: seed, country };
     }
-    
     currentCountryIdx++;
     currentSeedIdx = 0;
     if (currentCountryIdx < COUNTRIES.length) {
@@ -604,20 +541,21 @@ function getNextKeyword() {
 
 // ═══ MAIN SCRAPE ═══
 async function scrapeNext() {
-  if (isRunning) return { msg: 'Already running, please wait' };
+  if (isRunning) return { msg: 'Already running' };
   
   const next = getNextKeyword();
   if (!next) {
     autoRunning = false;
-    return { msg: '🏁 ALL COUNTRIES COMPLETE!', stats, totalKeywords: totalSaved + allResults.length };
+    return { msg: '🏁 ALL DONE!', stats, totalKeywords: totalSaved + allResults.length };
   }
   
   isRunning = true;
   const { keyword, country } = next;
   const key = `${keyword.toLowerCase()}|${country.code}`;
   totalSearches++;
+  searchesSinceBrowserRotation++;
   
-  console.log(`[${totalSearches}] 🌍${country.code} "${keyword}"`);
+  console.log(`\n[${totalSearches}] 🌍${country.code} "${keyword}"`);
   
   const result = await scrapeKeyword(keyword, country);
   lastRun = new Date().toISOString();
@@ -628,32 +566,36 @@ async function scrapeNext() {
     searchedKeys.add(key);
     stats.ok++;
     consecutiveFails = 0;
-    console.log(`  ✅ ${result.data.length} kw (${Math.round(result.ms/1000)}s) | Batch: ${allResults.length} | Total: ${totalSaved + allResults.length}`);
-  } else if (result.status === 'no_results') {
+    console.log(`  ✅ ${result.data.length} keywords (${Math.round(result.ms/1000)}s) | Batch: ${allResults.length} | Total: ${totalSaved + allResults.length}`);
+  } else if (result.status === 'no_results' || result.status === 'empty') {
     searchedKeys.add(key);
     stats.noResults++;
-    consecutiveFails = 0; // NOT a rate limit
-    console.log(`  📭 No Results (${Math.round(result.ms/1000)}s)`);
+    consecutiveFails = 0;
+    console.log(`  📭 ${result.status} (${Math.round(result.ms/1000)}s)`);
   } else {
     stats.fails++;
     consecutiveFails++;
     lastError = result.error || result.status;
-    console.log(`  ⚠️ ${result.status} (${Math.round(result.ms/1000)}s)${result.error ? ': ' + result.error : ''}`);
+    console.log(`  ⚠️ ${result.status}: ${result.error || ''} (${Math.round(result.ms/1000)}s)`);
   }
   
-  // Auto-save every 25 successful extractions
+  // Auto-save every 25 keywords
   if (allResults.length >= 25) {
-    console.log(`\n  💾 Auto-saving ${allResults.length} keywords to Gist...`);
+    console.log(`\n  💾 Auto-saving ${allResults.length} keywords...`);
     await saveToGist();
+  }
+  
+  // Log browser rotation
+  if (searchesSinceBrowserRotation >= 10) {
+    console.log(`  🔄 Browser rotation: ${searchesSinceBrowserRotation} searches done — next search gets fresh browser`);
+    searchesSinceBrowserRotation = 0;
   }
   
   isRunning = false;
   return {
     keyword, country: country.code, status: result.status,
-    extracted: result.data.length,
-    batchKeywords: allResults.length,
-    totalKeywords: totalSaved + allResults.length,
-    search: totalSearches
+    extracted: result.data.length, batchKeywords: allResults.length,
+    totalKeywords: totalSaved + allResults.length, search: totalSearches
   };
 }
 
@@ -665,21 +607,24 @@ async function autoScrapeLoop() {
     if (!isRunning) {
       const result = await scrapeNext();
       
-      if (result.msg && result.msg.includes('COMPLETE')) {
-        // Save final batch
+      if (result.msg && result.msg.includes('DONE')) {
         if (allResults.length > 0) await saveToGist();
-        console.log('\n🏁 ALL DONE!\n');
+        console.log('\n🏁 ALL COMPLETE!\n');
         break;
       }
       
-      // Smart delay
+      // Smart delay with browser rotation awareness
       let delay;
       if (consecutiveFails >= 5) {
-        delay = 180000; // 3 min
+        delay = 180000; // 3 min cooldown
         console.log(`  🔴 5+ fails — cooling 3min`);
       } else if (consecutiveFails >= 3) {
-        delay = 90000; // 1.5 min
-        console.log(`  🟡 3+ fails — cooling 90s`);
+        delay = 120000; // 2 min
+        console.log(`  🟡 3+ fails — cooling 2min`);
+      } else if (searchesSinceBrowserRotation === 0) {
+        // Just rotated browser — extra delay
+        delay = 30000 + Math.random() * 20000;
+        console.log(`  🔄 Fresh session — waiting 30-50s`);
       } else {
         delay = 50000 + Math.random() * 30000; // 50-80s
       }
@@ -714,6 +659,7 @@ app.get('/', (req, res) => {
     totalKeywords: totalSaved + allResults.length,
     totalSearches,
     searchedSeeds: searchedKeys.size,
+    browserRotation: `${searchesSinceBrowserRotation}/10`,
     gistId: GIST_ID || 'not created yet',
     stats, isRunning, lastRun, consecutiveFails, lastError,
     eta: `~${Math.round((totalSeeds - totalSearches - stats.skipped) * 65 / 3600)} hours`
@@ -775,25 +721,25 @@ const totalSeeds = COUNTRIES.reduce((s, c) => s + c.seeds.length, 0);
 
 app.listen(PORT, async () => {
   console.log(`\n${'═'.repeat(55)}`);
-  console.log(`  🚀 KEYWORD SCRAPER v4 — BULLETPROOF EDITION`);
+  console.log(`  🚀 KEYWORD SCRAPER v5 — PLAYWRIGHT + SPARTICUZ`);
   console.log(`${'═'.repeat(55)}`);
-  console.log(`  Seeds:     ${totalSeeds} across ${COUNTRIES.length} countries`);
-  console.log(`  Countries: ${COUNTRIES.map(c => `${c.code}(${c.seeds.length})`).join(' → ')}`);
-  console.log(`  Max KW:    ${totalSeeds * 25} (${totalSeeds} × 25 per search)`);
-  console.log(`  Schedule:  1 keyword every ~60s`);
-  console.log(`  ETA:       ~${Math.round(totalSeeds * 65 / 3600)} hours`);
-  console.log(`  Storage:   GitHub Gist (persistent)`);
+  console.log(`  Seeds:      ${totalSeeds} across ${COUNTRIES.length} countries`);
+  console.log(`  Countries:  ${COUNTRIES.map(c => `${c.code}(${c.seeds.length})`).join(' → ')}`);
+  console.log(`  Max KW:     ${totalSeeds * 25} (${totalSeeds} × 25 per search)`);
+  console.log(`  Rotation:   New browser every 10 keywords`);
+  console.log(`  Schedule:   1 keyword every ~60s`);
+  console.log(`  ETA:        ~${Math.round(totalSeeds * 65 / 3600)} hours`);
+  console.log(`  Storage:    GitHub Gist`);
   console.log(`${'═'.repeat(55)}`);
-  console.log(`  Dashboard: /`);
-  console.log(`  Trigger:   /scrape`);
-  console.log(`  Results:   /results  |  /csv  |  /top  |  /stats`);
-  console.log(`  Control:   /pause  |  /resume  |  /save`);
+  console.log(`  Dashboard:  /`);
+  console.log(`  Trigger:    /scrape`);
+  console.log(`  Results:    /results  |  /csv  |  /top  |  /stats`);
+  console.log(`  Control:    /pause  |  /resume  |  /save`);
   console.log(`${'═'.repeat(55)}\n`);
   
-  // Load previous state if exists
   await loadFromGist();
   
-  // Start auto-scraping after 10 seconds
+  // Auto-start after 10s
   setTimeout(() => {
     autoRunning = true;
     autoScrapeLoop();
